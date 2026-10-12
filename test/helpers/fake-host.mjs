@@ -62,6 +62,14 @@ export async function createFakeHost(options = {}) {
   /** Called after every native enablement change, like the real plugin manager. */
   let onPluginManagerChange = null;
 
+  /**
+   * Optional async gate awaited before a native enable/disable takes effect.
+   *
+   * Interleaving regressions need a deterministic boundary rather than a sleep:
+   * this lets a test hold one native call open while another operation runs.
+   */
+  let gateSetEnabled = null;
+
   const pluginManager = {
     async listBundles() {
       return [...bundles.values()].map((row) => ({
@@ -74,6 +82,7 @@ export async function createFakeHost(options = {}) {
       }));
     },
     async setBundleEnabled(name, enabled) {
+      if (gateSetEnabled !== null) await gateSetEnabled({ name, enabled });
       calls.push({ kind: 'setBundleEnabled', name, enabled });
       const row = bundles.get(name);
       if (row === undefined) throw new Error(`unknown bundle ${name}`);
@@ -160,6 +169,13 @@ export async function createFakeHost(options = {}) {
      */
     onPluginManagerChange(listener) {
       onPluginManagerChange = listener;
+    },
+    /**
+     * Install a gate awaited before every native enable/disable.
+     * @param {((event: {name: string, enabled: boolean}) => Promise<void>)|null} gate
+     */
+    gateSetBundleEnabled(gate) {
+      gateSetEnabled = gate;
     },
     workspace: {
       /** Register a directory as a workspace. @param {string} path @param {string} [title] */

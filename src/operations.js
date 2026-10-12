@@ -8,7 +8,7 @@ import { readdir, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Fault, CODES } from './errors.js';
 import { archivePath, importFromPath } from './archive.js';
-import { leasesOf, planSleep, planWake } from './coordinator.js';
+import { leasesOf, planSleep, planUnbind, planWake } from './coordinator.js';
 import { evaluatePackage, readBundles } from './inventory.js';
 import { SleepQueue } from './lifecycle.js';
 import { readScaffoldDescriptor, summarizeDescriptor } from './scaffold.js';
@@ -87,6 +87,50 @@ export class Operations {
 
   /** Whether a change event arrived during a native write and still needs a pass. */
   #reconcileWanted = false;
+
+  /** Tail of the chain that serializes whole mutating operations. */
+  #writeChain = Promise.resolve();
+
+  /**
+   * Run a whole mutating operation exclusively, from its revision check through
+   * its native side effects to its commit.
+   *
+   * The store's own lock only makes a single state write atomic. That is not
+   * enough for these operations, which read a revision, perform native
+   * enable/disable calls, and only then commit: two of them can interleave so
+   * that the last state written contradicts the native reality. Two concrete
+   * failures that follow:
+   *
+   * - a shelf commits `sleeping`, a wake then sees the package still enabled and
+   *   skips enabling it, and the shelf's delayed disable lands afterwards,
+   *   leaving `requestedState=awake` with the package off;
+   * - a wake enables natively, a concurrent write commits first, and the wake's
+   *   own commit fails with `revision-conflict` - the caller is told nothing
+   *   happened while the native side has already changed.
+   *
+   * Holding this for the duration removes both, because the revision can no
+   * longer move between the check and the commit.
+   *
+   * MUST NOT be entered recursively: a nested call would wait for a chain that
+   * only the current holder can advance and would hang. Every entry point below
+   * takes it exactly once, at the outermost level.
+   * @template T
+   * @param {() => Promise<T>} job
+   * @returns {Promise<T>}
+   */
+  async #critical(job) {
+    const previous = this.#writeChain;
+    let done;
+    this.#writeChain = new Promise((resolve) => {
+      done = resolve;
+    });
+    await previous;
+    try {
+      return await job();
+    } finally {
+      done();
+    }
+  }
 
   /**
    * @param {{host: object, store: import('./store.js').Store, activity: import('./lifecycle.js').Activity}} deps
@@ -213,7 +257,9 @@ export class Operations {
       this.#reconcileWanted = true;
       return null;
     }
-    return await this.#reconcile();
+    // Reconciliation writes state, so it belongs to the same exclusive section
+    // as the operations it may be observing rather than racing them.
+    return await this.#critical(async () => await this.#reconcile());
   }
 
   /**
@@ -234,8 +280,9 @@ export class Operations {
       if (!Number.isInteger(request.expectedRevision)) {
         throw new Fault(CODES.invalidRequest, { field: 'expectedRevision' });
       }
-      // Both guards are applied here, once, in this order, rather than inside
-      // each action:
+      // The whole mutating operation runs exclusively, so the revision it was
+      // checked against is still the revision it commits against. Both guards
+      // are applied once, in this order, inside the critical section:
       //
       // 1. A recorded operationId with identical arguments is a retry and must
       //    return its original outcome even though the revision has moved on.
@@ -243,30 +290,62 @@ export class Operations {
       //    action that would have been a harmless no-op (sleep on a workspace
       //    with no association) still reports the conflict, so a caller can
       //    never mistake "your snapshot was stale" for "everything was fine".
-      const replayed = this.#replayOf(action, request);
-      if (replayed !== null) return replayed;
-      if (request.expectedRevision !== this.store.revision) {
-        throw new Fault(CODES.revisionConflict, {
-          expectedRevision: request.expectedRevision,
-          currentRevision: this.store.revision,
-        });
-      }
-    }
-    if (request.background === true && TRACKED_ACTIONS.has(action)) {
-      // Long work over HTTP: answer immediately with the id to poll, rather than
-      // holding the connection open through a package-manager run. `#dispatch`
-      // synchronously registers its progress entry before its first await, so
-      // the entry already exists by the time this returns.
-      void this.#dispatch(action, request)
-        .catch(() => {})
-        .finally(() => {});
-      return {
-        operationId: request.operationId,
-        action,
-        status: 'running',
-        background: true,
-        progress: await this.#progressFor(request.operationId),
+      //
+      // Checking before taking the lock is not enough: a caller whose revision
+      // was current on arrival can find it stale once it owns the section, and
+      // refusing here means refusing before any native side effect.
+      const run = async () => {
+        const replayed = this.#replayOf(action, request);
+        if (replayed !== null) return replayed;
+        if (request.expectedRevision !== this.store.revision) {
+          throw new Fault(CODES.revisionConflict, {
+            expectedRevision: request.expectedRevision,
+            currentRevision: this.store.revision,
+          });
+        }
+        try {
+          return await this.#dispatch(action, request);
+        } finally {
+          // Drained inside the section: reconciliation mutates state, and doing
+          // that after releasing the lock would reintroduce the conflict this
+          // section exists to prevent.
+          await this.#drainReconcile();
+        }
       };
+
+      if (request.background === true && TRACKED_ACTIONS.has(action)) {
+        // Long work over HTTP: answer immediately with the id to poll, rather
+        // than holding the connection open through a package-manager run.
+        //
+        // The entry is registered here rather than inside `#dispatch`, because
+        // the work now queues behind the critical section and may not have
+        // started when this returns. Because the acknowledgement can therefore
+        // be sent before the revision is re-checked or any step runs, a failure
+        // is reported through the progress entry instead of the response - the
+        // caller polls `/progress` or `operation-status` and sees it.
+        this.progress.begin(request.operationId, action, PLAN[action] ?? []);
+        void this.#critical(run).catch((error) => {
+          const entry = this.progress.get(request.operationId);
+          if (entry !== null && entry.status === 'running') {
+            this.progress.finish(request.operationId, {
+              ok: false,
+              code: error instanceof Fault ? error.code : CODES.nativeOperationFailed,
+              details:
+                error instanceof Fault
+                  ? error.details
+                  : { message: error instanceof Error ? error.message : String(error) },
+            });
+          }
+        });
+        return {
+          operationId: request.operationId,
+          action,
+          status: 'running',
+          background: true,
+          progress: await this.#progressFor(request.operationId),
+        };
+      }
+      return await this.#critical(run);
     }
     try {
       return await this.#dispatch(action, request);
@@ -294,7 +373,11 @@ export class Operations {
     if (!TRACKED_ACTIONS.has(action)) return await this.#route(action, request, null);
 
     const operationId = request.operationId;
-    this.progress.begin(operationId, action, PLAN[action]);
+    // A background request already registered its entry so the acknowledgement
+    // could carry it; re-registering here would reset the steps it has begun.
+    if (this.progress.get(operationId)?.status !== 'running') {
+      this.progress.begin(operationId, action, PLAN[action]);
+    }
     const report = {
       activate: (label) => this.progress.activate(operationId, label),
       complete: (label, outcome) => this.progress.complete(operationId, label, outcome),
@@ -886,10 +969,21 @@ export class Operations {
     if (state.workspaces[args.workspaceId] === undefined) {
       throw new Fault(CODES.workspaceNotFound, { workspaceId: args.workspaceId });
     }
-    // The release plan is computed *before* the binding disappears: afterwards
-    // the removed association is no longer visible in state, so the packages it
-    // uniquely held would look like they belong to nobody.
-    const plan = planSleep(state, args.workspaceId);
+    // Only the package behind the removed association is ever a candidate, and
+    // never the workspace's whole shelf plan: `planUnbind` simulates this one
+    // removal against the pre-removal state, so the workspace's remaining
+    // associations and every other workspace are still visible when deciding
+    // whether anything is still claimed. Using `planSleep` here would release
+    // every package the workspace uniquely held - removing one scaffold would
+    // take away the others too.
+    //
+    // The release is deliberately immediate, without the shelf's busy guard.
+    // Unbinding is an explicit reconfiguration: the user just said this project
+    // no longer needs the scaffold, and a tool list is fixed per model request,
+    // so the in-flight turn is not interrupted. A shelf is different - it is a
+    // background intent about a project that is actively in use, which is why
+    // that path queues instead.
+    const plan = planUnbind(state, args.workspaceId, args.bindingId);
     const committed = await this.store.mutate(
       { action: 'unbind', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
       (draft) => {
@@ -903,9 +997,8 @@ export class Operations {
         return { workspaceId: args.workspaceId, bindingId: args.bindingId, removed: true };
       },
     );
-    // Removing an association must never take a bundle away from a workspace
-    // that still needs it; `#releaseKeys` applies the same safety rules a sleep
-    // uses, against the pre-removal plan.
+    // `#releaseKeys` applies the same safety rules a shelf uses, against the
+    // plan for the single removed association.
     const released = await this.#releaseKeys(plan.release, 'unbind');
     return { ...committed.value, release: { ...released, kept: plan.keep } };
   }
@@ -1196,13 +1289,16 @@ export class Operations {
    * @returns {Promise<object>}
    */
   async #applyDeferredSleep(workspaceId, trigger) {
-    // Deferred work runs outside `execute()`, so it drains the change events its
-    // own native writes produced rather than leaving them pending.
-    try {
-      return await this.#releaseForWorkspace(workspaceId, trigger);
-    } finally {
-      await this.#drainReconcile();
-    }
+    // Deferred work runs outside `execute()`, so it takes the critical section
+    // itself: it performs the same native releases and state commits as a
+    // caller-driven shelf, and must not interleave with one.
+    return await this.#critical(async () => {
+      try {
+        return await this.#releaseForWorkspace(workspaceId, trigger);
+      } finally {
+        await this.#drainReconcile();
+      }
+    });
   }
 
   /**

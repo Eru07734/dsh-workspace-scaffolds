@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CODES } from '../src/errors.js';
@@ -28,6 +28,31 @@ async function fixture(files, variableDefinition = { projectName: { required: tr
     packageDir,
     descriptor: { title: 't', requires: [], variables: variableDefinition, templates: [{ id: 't1', title: 't1', files: templateFiles }] },
     cleanup: async () => await rm(packageDir, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * Create a directory link. Windows uses a junction, which needs no elevation;
+ * other platforms get a plain directory symlink.
+ * @param {string} target @param {string} linkPath
+ */
+async function linkDirectory(target, linkPath) {
+  await symlink(target, linkPath, 'junction');
+}
+
+/**
+ * The preview input for the single template of a fixture.
+ * @param {string} workspaceRoot @param {object} descriptor
+ */
+function previewInput(workspaceRoot, descriptor) {
+  return {
+    workspaceRoot,
+    descriptor,
+    template: descriptor.templates[0],
+    values: { projectName: 'demo' },
+    packageKey: 'p@1.0.0',
+    workspaceId: 'ws-1',
+    bindingId: 'b1',
   };
 }
 
@@ -186,6 +211,147 @@ test('a target that escapes the workspace is refused', async () => {
       }),
       (error) => error.code === CODES.pathOutsideWorkspace,
     );
+  } finally {
+    await cleanup();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('a workspace directory link that leads outside is refused at preview and nothing is written', async () => {
+  const { descriptor, cleanup } = await fixture({ 'templates/linked/output.txt': '{{projectName}}\n' });
+  const workspace = await mkdtemp(join(tmpdir(), 'wss-ws-'));
+  const outside = await mkdtemp(join(tmpdir(), 'wss-outside-'));
+  try {
+    // The literal target `linked/output.txt` is inside the workspace; the link
+    // makes the filesystem object it names live somewhere else entirely.
+    await linkDirectory(outside, join(workspace, 'linked'));
+    // Prove the fixture is a genuine link rather than a plain directory, so a
+    // passing test cannot be an artifact of the link never having been made.
+    assert.equal((await lstat(join(workspace, 'linked'))).isSymbolicLink(), true);
+
+    await assert.rejects(
+      buildPreview(previewInput(workspace, descriptor)),
+      (error) => error.code === CODES.pathOutsideWorkspace,
+    );
+    assert.deepEqual(await readdir(outside), [], 'the preview must not create anything outside the workspace');
+  } finally {
+    await cleanup();
+    await rm(workspace, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('a link that leaves the workspace is caught even below existing subdirectories', async () => {
+  const { descriptor, cleanup } = await fixture({ 'templates/linked/sub/deep.txt': '{{projectName}}\n' });
+  const workspace = await mkdtemp(join(tmpdir(), 'wss-ws-'));
+  const outside = await mkdtemp(join(tmpdir(), 'wss-outside-'));
+  try {
+    // `outside/sub` exists, so the target's nearest existing ancestor sits
+    // below the link rather than being the link itself.
+    await mkdir(join(outside, 'sub'), { recursive: true });
+    await linkDirectory(outside, join(workspace, 'linked'));
+
+    await assert.rejects(
+      buildPreview(previewInput(workspace, descriptor)),
+      (error) => error.code === CODES.pathOutsideWorkspace,
+    );
+    assert.deepEqual(await readdir(join(outside, 'sub')), [], 'nothing may be written through the link');
+  } finally {
+    await cleanup();
+    await rm(workspace, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('a target under a link whose destination does not exist is refused, not crashed on', async () => {
+  const { descriptor, cleanup } = await fixture({ 'templates/linked/output.txt': '{{projectName}}\n' });
+  const workspace = await mkdtemp(join(tmpdir(), 'wss-ws-'));
+  try {
+    // A link to a missing path still exists as an entry, so `realpath` cannot
+    // prove where a write would land. Refusing is the only honest answer.
+    await linkDirectory(join(workspace, 'not-created-yet'), join(workspace, 'linked'));
+    await assert.rejects(
+      buildPreview(previewInput(workspace, descriptor)),
+      (error) => error.code === CODES.pathOutsideWorkspace,
+    );
+  } finally {
+    await cleanup();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('a workspace root that is itself reached through a link still accepts ordinary targets', async () => {
+  const { descriptor, cleanup } = await fixture({ 'templates/docs/deep/output.txt': '{{projectName}}\n' });
+  const real = await mkdtemp(join(tmpdir(), 'wss-real-'));
+  const holder = await mkdtemp(join(tmpdir(), 'wss-holder-'));
+  const workspace = join(holder, 'ws-link');
+  try {
+    await linkDirectory(real, workspace);
+    const preview = await buildPreview(previewInput(workspace, descriptor));
+    assert.equal(preview.files[0].status, 'create');
+    const applied = await applyPreview({ preview, descriptor, template: descriptor.templates[0] });
+    assert.deepEqual(applied.created, ['docs/deep/output.txt']);
+    assert.equal(await readFile(join(real, 'docs', 'deep', 'output.txt'), 'utf8'), 'demo\n');
+  } finally {
+    await cleanup();
+    await rm(real, { recursive: true, force: true });
+    await rm(holder, { recursive: true, force: true });
+  }
+});
+
+test('a directory swapped for an outside link after preview is refused at apply', async () => {
+  const { descriptor, cleanup } = await fixture({ 'templates/docs/output.txt': '{{projectName}}\n' });
+  const workspace = await mkdtemp(join(tmpdir(), 'wss-ws-'));
+  const outside = await mkdtemp(join(tmpdir(), 'wss-outside-'));
+  try {
+    await mkdir(join(workspace, 'docs'), { recursive: true });
+    const preview = await buildPreview(previewInput(workspace, descriptor));
+    assert.equal(preview.files[0].status, 'create');
+
+    // Swap the real directory for a link between preview and apply: the literal
+    // path is unchanged, so only a real-path check can catch this.
+    await rm(join(workspace, 'docs'), { recursive: true, force: true });
+    await linkDirectory(outside, join(workspace, 'docs'));
+
+    await assert.rejects(
+      applyPreview({ preview, descriptor, template: descriptor.templates[0] }),
+      (error) => error.code === CODES.pathOutsideWorkspace,
+    );
+    assert.deepEqual(await readdir(outside), [], 'the apply must not create anything outside the workspace');
+  } finally {
+    await cleanup();
+    await rm(workspace, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('an in-workspace target whose parent directories do not exist yet is still created', async () => {
+  const { descriptor, cleanup } = await fixture({ 'templates/docs/deep/output.txt': '{{projectName}}\n' });
+  const workspace = await mkdtemp(join(tmpdir(), 'wss-ws-'));
+  try {
+    const preview = await buildPreview(previewInput(workspace, descriptor));
+    assert.equal(preview.files[0].status, 'create');
+    const applied = await applyPreview({ preview, descriptor, template: descriptor.templates[0] });
+    assert.deepEqual(applied.created, ['docs/deep/output.txt']);
+    assert.equal(await readFile(join(workspace, 'docs', 'deep', 'output.txt'), 'utf8'), 'demo\n');
+  } finally {
+    await cleanup();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('a workspace directory link that stays inside is resolved, not blanket-refused', async () => {
+  const { descriptor, cleanup } = await fixture({ 'templates/linked/output.txt': '{{projectName}}\n' });
+  const workspace = await mkdtemp(join(tmpdir(), 'wss-ws-'));
+  try {
+    await mkdir(join(workspace, 'actual'), { recursive: true });
+    await linkDirectory(join(workspace, 'actual'), join(workspace, 'linked'));
+
+    const preview = await buildPreview(previewInput(workspace, descriptor));
+    assert.equal(preview.files[0].status, 'create');
+    const applied = await applyPreview({ preview, descriptor, template: descriptor.templates[0] });
+    assert.deepEqual(applied.created, ['linked/output.txt']);
+    assert.equal(await readFile(join(workspace, 'actual', 'output.txt'), 'utf8'), 'demo\n');
   } finally {
     await cleanup();
     await rm(workspace, { recursive: true, force: true });

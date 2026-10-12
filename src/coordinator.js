@@ -177,6 +177,52 @@ export function planSleep(state, workspaceId) {
 }
 
 /**
+ * Which packages one removed association releases.
+ *
+ * Unbinding removes a single declared need, not all of a workspace's needs, so
+ * this cannot reuse {@link planSleep}: that answers "what may go when the whole
+ * workspace sleeps" and would release every package the workspace uniquely
+ * holds. Here only the package behind the removed binding is a candidate, and
+ * only when nobody else - including this workspace's remaining associations -
+ * still claims it.
+ * @param {object} state
+ * @param {string} workspaceId
+ * @param {string} bindingId
+ * @returns {{release: string[], keep: Array<{key: string, reason: string, holders: string[]}>}}
+ */
+export function planUnbind(state, workspaceId, bindingId) {
+  const workspace = state.workspaces[workspaceId];
+  if (workspace === undefined) throw new Fault(CODES.workspaceNotFound, { workspaceId });
+  const binding = workspace.bindings.find((entry) => entry.id === bindingId);
+  if (binding === undefined) {
+    throw new Fault(CODES.invalidRequest, { field: 'bindingId', reason: 'unknown-binding' });
+  }
+  const key = keyOf(binding);
+  // A disabled association never claimed anything, so removing it must not
+  // change native state at all.
+  if (binding.enabled === false) return { release: [], keep: [] };
+
+  const simulated = {
+    ...state,
+    workspaces: {
+      ...state.workspaces,
+      [workspaceId]: {
+        ...workspace,
+        bindings: workspace.bindings.filter((entry) => entry.id !== bindingId),
+      },
+    },
+  };
+  const holders = leasesOf(simulated).get(key) ?? [];
+  if (holders.length > 0) return { release: [], keep: [{ key, reason: 'other-workspace', holders }] };
+
+  const record = state.packages[key] ?? null;
+  if (record === null) return { release: [], keep: [{ key, reason: 'unrecorded', holders: [] }] };
+  if (record.pinned) return { release: [], keep: [{ key, reason: 'pinned', holders: [] }] };
+  if (record.ownership === 'external') return { release: [], keep: [{ key, reason: 'external', holders: [] }] };
+  return { release: [key], keep: [] };
+}
+
+/**
  * Describe why a package is retained, for the panel.
  * @param {string} reason
  * @returns {string} A stable identifier the client maps to localized text.

@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { gzipSync } from 'node:zlib';
-import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { extractTarball, inspectTarball, packDirectory } from '../src/tar.js';
@@ -52,6 +52,30 @@ function tarball(...parts) {
   return gzipSync(Buffer.concat([...parts, Buffer.alloc(1024, 0)]));
 }
 
+/**
+ * Every file below `dir` as a slash-separated relative path.
+ * @param {string} dir @param {string} [prefix]
+ * @returns {Promise<string[]>}
+ */
+async function listFiles(dir, prefix = '') {
+  const found = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const relative = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) found.push(...(await listFiles(join(dir, entry.name), relative)));
+    else found.push(relative);
+  }
+  return found;
+}
+
+/**
+ * Create a directory link. Windows uses a junction, which needs no elevation;
+ * other platforms get a plain directory symlink.
+ * @param {string} target @param {string} linkPath
+ */
+async function linkDirectory(target, linkPath) {
+  await symlink(target, linkPath, 'junction');
+}
+
 test('packDirectory round-trips a package under the npm `package/` prefix', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'wss-tar-'));
   try {
@@ -82,6 +106,41 @@ test('packDirectory skips node_modules and .git', async () => {
     assert.deepEqual(paths, ['package', 'package/package.json']);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('packDirectory never follows a directory link into content outside the package', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'wss-tar-'));
+  const outside = await mkdtemp(join(tmpdir(), 'wss-outside-'));
+  try {
+    await writeFile(join(dir, 'package.json'), '{"name":"x","version":"1.0.0"}');
+    await mkdir(join(outside, 'nested'), { recursive: true });
+    await writeFile(join(outside, 'secret.txt'), 'EXTERNAL-SECRET');
+    await writeFile(join(outside, 'nested', 'deep.txt'), 'EXTERNAL-DEEP');
+    // A real directory link inside the package: the pack must refuse to reach
+    // through it, exactly as its contract claims.
+    await linkDirectory(outside, join(dir, 'linked'));
+    // Prove the fixture is a genuine link rather than a plain directory, so a
+    // passing test cannot be an artifact of the link never having been made.
+    assert.equal((await lstat(join(dir, 'linked'))).isSymbolicLink(), true);
+    assert.equal((await stat(join(dir, 'linked'))).isDirectory(), true);
+
+    const packed = await packDirectory(dir);
+    const paths = inspectTarball(packed.buffer).entries.map((entry_) => entry_.path).sort();
+    assert.deepEqual(paths, ['package', 'package/package.json'], 'nothing behind the link may be archived');
+
+    // Unpacking the archive must not reproduce the external files either.
+    const restored = await mkdtemp(join(tmpdir(), 'wss-restore-'));
+    try {
+      await extractTarball(packed.buffer, restored, (entryPath) => resolveInside(restored, entryPath));
+      assert.deepEqual(await listFiles(restored), ['package.json']);
+      assert.equal(await readFile(join(restored, 'package.json'), 'utf8'), '{"name":"x","version":"1.0.0"}');
+    } finally {
+      await rm(restored, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 

@@ -4,7 +4,7 @@
  * @module dsh-workspace-scaffolds/util
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Fault, CODES } from './errors.js';
 
@@ -94,6 +94,75 @@ export function resolveInside(root, relativeTarget) {
   const absolute = resolve(root, relativeTarget);
   if (!pathInside(root, absolute)) {
     throw new Fault(CODES.pathOutsideWorkspace, { target: relativeTarget });
+  }
+  return absolute;
+}
+
+/**
+ * The deepest ancestor of `absolute` (including `absolute` itself) that exists
+ * on disk. `lstat` is deliberate: a link is an existing entry, and finding one
+ * is exactly what the caller needs to resolve.
+ * @param {string} absolute
+ * @param {string} relativeTarget For diagnostics.
+ * @returns {Promise<string>}
+ */
+async function nearestExistingAncestor(absolute, relativeTarget) {
+  let candidate = absolute;
+  for (;;) {
+    try {
+      await lstat(candidate);
+      return candidate;
+    } catch (error) {
+      // A missing entry is expected while walking up. Any other failure
+      // (EACCES, ELOOP, ...) means containment cannot be proven, and refusing
+      // is the safe answer.
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') {
+        throw new Fault(CODES.pathOutsideWorkspace, { target: relativeTarget, reason: 'unresolvable-path' });
+      }
+    }
+    const parent = dirname(candidate);
+    if (parent === candidate) {
+      throw new Fault(CODES.pathOutsideWorkspace, { target: relativeTarget, reason: 'no-existing-ancestor' });
+    }
+    candidate = parent;
+  }
+}
+
+/**
+ * Like {@link resolveInside}, but also proves that the filesystem really puts
+ * the target inside `root`. `resolveInside` only compares spellings, so a
+ * Windows junction (or any directory link) inside the workspace can make
+ * `linked/output.txt` land anywhere; `mkdir` and `writeFile` downstream would
+ * follow it. Resolving the target's nearest existing ancestor through
+ * `realpath` closes that gap: a junction that leaves the workspace resolves
+ * outside the real root and is refused.
+ *
+ * The returned value keeps the literal spelling, exactly like `resolveInside`,
+ * so callers and diagnostics stay unchanged.
+ *
+ * Known residual risk, stated rather than papered over: this check and the
+ * subsequent write are separate syscalls, so a writer who can replace a
+ * directory inside the workspace with a link between the two can still redirect
+ * the write. Node exposes no `openat`-style API that would bind the check to
+ * the write, so the race cannot be closed at this layer; the same gap also
+ * exists between `lstat` and `readFile` while packing an archive.
+ *
+ * @param {string} root
+ * @param {string} relativeTarget
+ * @returns {Promise<string>} The resolved absolute target.
+ */
+export async function resolveInsideReal(root, relativeTarget) {
+  const absolute = resolveInside(root, relativeTarget);
+  const realRoot = await realpath(resolve(root)).catch(() => null);
+  if (realRoot === null) {
+    // Without a real root there is nothing to prove containment against; a
+    // workspace that vanished under us is a refusal, not a silent pass.
+    throw new Fault(CODES.pathOutsideWorkspace, { target: relativeTarget, reason: 'unresolvable-root' });
+  }
+  const ancestor = await nearestExistingAncestor(absolute, relativeTarget);
+  const realAncestor = await realpath(ancestor).catch(() => null);
+  if (realAncestor === null || !pathInside(realRoot, realAncestor)) {
+    throw new Fault(CODES.pathOutsideWorkspace, { target: relativeTarget, reason: 'link-escapes-workspace' });
   }
   return absolute;
 }

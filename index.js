@@ -148,8 +148,15 @@ export function apply(ctx) {
     if (workspace === undefined || !workspace.autoRestore) return null;
     if (snapshot.capabilities.pluginManager !== true) return null;
     if (workspace.bindings.length === 0) return null;
-    const wanted = workspace.bindings.filter((binding) => binding.enabled);
-    if (wanted.length > 0 && wanted.every((binding) => binding.package.enabled)) return null;
+    // Restoring is not the same as enabling. An agent has just started in this
+    // workspace, so it must end up recorded as awake and holding its packages
+    // even when every one of them is already enabled - which is the normal case
+    // for a bundle another workspace turned on. Returning early there left the
+    // workspace marked sleeping with no lease, so the workspace that *did* hold
+    // the shared bundle would release it out from under this one when it slept.
+    // `wake` commits the intent and reports 'already-enabled' for each package,
+    // and it also cancels any shelf still queued for this workspace.
+    //
     // The automatic path never installs: a package manager run inside agent
     // creation would stall startup for an unbounded time. Missing packages are
     // reported instead, and the explicit "restore and open" action performs them.

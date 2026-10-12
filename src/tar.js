@@ -8,7 +8,7 @@
  * @module dsh-workspace-scaffolds/tar
  */
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readdir, readFile, lstat, stat } from 'node:fs/promises';
 import { join, posix, sep } from 'node:path';
 import { Fault, CODES } from './errors.js';
 
@@ -83,7 +83,18 @@ function header(entry) {
 
 /**
  * Walk a directory into archive entries, skipping excluded segments and never
- * following symbolic links.
+ * following symbolic links or Windows junctions.
+ *
+ * Links are detected twice, both without following them: the `readdir` dirent
+ * already reports a link (a junction included) as a symbolic-link entry, and
+ * the `lstat` below confirms it on the filesystem. An earlier version used
+ * `stat`, which resolves the link first, so its `isSymbolicLink()` was always
+ * false and the walk recursed straight through a junction into whatever it
+ * pointed at. Do not "simplify" this back to `stat`.
+ *
+ * Residual risk: `lstat` and the later `readFile(entry.path)` are separate
+ * syscalls, so a link swapped in between them can still redirect a read; Node
+ * offers no handle-bound variant to close that window here.
  * @param {string} root
  * @param {string} relativePath
  * @param {Array<{path: string, relative: string, kind: 'file'|'directory', mode: number, mtime: number, size: number}>} out
@@ -94,9 +105,10 @@ async function walk(root, relativePath, out) {
   entries.sort((left, right) => left.name.localeCompare(right.name));
   for (const entry of entries) {
     if (EXCLUDED_SEGMENTS.has(entry.name)) continue;
+    if (entry.isSymbolicLink()) continue;
     const relative = relativePath === '' ? entry.name : `${relativePath}/${entry.name}`;
     const child = join(root, ...relative.split('/'));
-    const info = await stat(child);
+    const info = await lstat(child);
     if (info.isSymbolicLink()) continue;
     if (info.isDirectory()) {
       out.push({ path: child, relative, kind: 'directory', mode: 0o755, mtime: Math.floor(info.mtimeMs / 1000), size: 0 });

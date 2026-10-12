@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { apply, inject, name } from '../index.js';
 import { API_PREFIX } from '../src/api.js';
 import { CODES } from '../src/errors.js';
+import { newId } from '../src/util.js';
 import { TOOL_NAME } from '../src/tool.js';
 import { createFakeHost, writeScaffoldPackage } from './helpers/fake-host.mjs';
 
@@ -186,6 +187,94 @@ test('the tool mounted by apply resolves the session workspace through its facad
     const resolved = await tool.execute({ action: 'sleep', expectedRevision: listed.value.revision }, exec);
     assert.equal(resolved.ok, true, `sleep failed: ${resolved.code} ${JSON.stringify(resolved.details)}`);
     assert.equal(resolved.resolvedWorkspaceId, workspace.workspaceId);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('automatic restore records the workspace even when the bundle is already on', async () => {
+  const fake = await createFakeHost();
+  try {
+    const mounted = mount(fake);
+    const api = mounted.provided.get('workspaceScaffolds');
+    const revision = async () => (await api.execute({ action: 'list' })).revision;
+
+    const dirA = join(fake.workspace.root, 'shared-holder');
+    const dirB = join(fake.workspace.root, 'shared-joiner');
+    const a = await fake.workspace.add(dirA, 'holder');
+    const b = await fake.workspace.add(dirB, 'joiner');
+    const packageDir = await writeScaffoldPackage(join(fake.workspace.root, 'pkg'), {
+      name: 'dsh-scaffold-notes',
+      version: '0.1.0',
+      scaffold: {
+        schemaVersion: 1,
+        title: 'Notes',
+        variables: { projectName: { type: 'string', required: true } },
+        templates: [{ id: 'notes', files: [{ source: 'templates/N.md', target: 'docs/N.md', render: 'text' }] }],
+      },
+      files: { 'templates/N.md': '# {{projectName}}\n' },
+    });
+    const imported = await api.execute({
+      action: 'import',
+      path: packageDir,
+      operationId: newId(),
+      expectedRevision: await revision(),
+    });
+    for (const workspaceId of [a.workspaceId, b.workspaceId]) {
+      await api.execute({
+        action: 'bind',
+        workspaceId,
+        packageName: imported.packageName,
+        version: imported.version,
+        operationId: newId(),
+        expectedRevision: await revision(),
+      });
+    }
+
+    // A wakes the shared bundle; B is still recorded as sleeping.
+    await api.execute({
+      action: 'wake',
+      workspaceId: a.workspaceId,
+      operationId: newId(),
+      expectedRevision: await revision(),
+    });
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+
+    // An agent starts in B. The bundle is already on, so nothing needs enabling -
+    // but B must still be recorded as awake and holding it, or A's shelf will
+    // take the bundle away from the agent that just started here.
+    const handler = mounted.listeners.get('agent/created');
+    await handler({ agent: { id: 'agent-b', session: { header: { cwd: dirB } } } });
+
+    let listed = await api.execute({ action: 'list' });
+    const recordB = listed.workspaces.find((row) => row.workspaceId === b.workspaceId);
+    assert.equal(recordB.requestedState, 'awake', 'the automatically restored workspace must be awake');
+    assert.equal(recordB.ready, true);
+    const pkg = listed.packages.find((row) => row.key === imported.packageKey);
+    assert.deepEqual(
+      [...pkg.holders].sort(),
+      [a.workspaceId, b.workspaceId].sort(),
+      'both workspaces must hold the shared bundle',
+    );
+
+    // The payoff: shelving the first workspace must leave the bundle running for
+    // the second one.
+    const slept = await api.execute({
+      action: 'sleep',
+      workspaceId: a.workspaceId,
+      operationId: newId(),
+      expectedRevision: await revision(),
+    });
+    assert.deepEqual(slept.release.released, []);
+    assert.equal(slept.release.kept[0].reason, 'other-workspace');
+    assert.equal(
+      fake.bundles.get('dsh-scaffold-notes').enabled,
+      true,
+      'a shelf must not disable a bundle another workspace still needs',
+    );
+
+    listed = await api.execute({ action: 'list' });
+    assert.equal(listed.workspaces.find((row) => row.workspaceId === b.workspaceId).ready, true);
   } finally {
     await fake.cleanup();
   }

@@ -686,6 +686,216 @@ test('workspace-register requires a revision like every other write', async () =
   }
 });
 
+/**
+ * Build one checks scaffold package on disk. Distinct from the notes package so
+ * a workspace can hold two different scaffolds at once.
+ * @param {string} root
+ */
+async function checksPackage(root) {
+  return await writeScaffoldPackage(join(root, 'pkg-checks'), {
+    name: 'dsh-scaffold-checks',
+    version: '0.1.0',
+    scaffold: {
+      schemaVersion: 1,
+      title: 'Project checks',
+      variables: { projectName: { type: 'string', required: true } },
+      templates: [
+        { id: 'checks', files: [{ source: 'templates/CHECKS.md', target: 'docs/CHECKS.md', render: 'text' }] },
+      ],
+    },
+    files: { 'templates/CHECKS.md': '# {{projectName}}\n\nChecklist.\n' },
+  });
+}
+
+/** Import a package and bind it to a workspace. */
+async function bindPackage(operations, workspaceId, directory, templateId) {
+  const imported = await write(operations, { action: 'import', path: directory });
+  const binding = await write(operations, {
+    action: 'bind',
+    workspaceId,
+    packageName: imported.packageName,
+    version: imported.version,
+    ...(templateId === undefined ? {} : { templateId }),
+  });
+  return { imported, binding };
+}
+
+test('unbinding one association leaves the workspace\u2019s other scaffolds running', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'two-scaffolds'), 'two');
+    const notes = await bindPackage(operations, workspace.workspaceId, await notesPackage(fake.workspace.root));
+    const checks = await bindPackage(operations, workspace.workspaceId, await checksPackage(fake.workspace.root));
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+    assert.equal(fake.bundles.get('dsh-scaffold-checks').enabled, true);
+
+    // Removing one association is a statement about that scaffold only. The
+    // shelf plan for the whole workspace would release both.
+    const unbound = await write(operations, {
+      action: 'unbind',
+      workspaceId: workspace.workspaceId,
+      bindingId: notes.binding.bindingId,
+    });
+    assert.deepEqual(
+      unbound.release.released.map((row) => row.key),
+      ['dsh-scaffold-notes@0.1.0'],
+      'only the removed association may be released',
+    );
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, false);
+    assert.equal(
+      fake.bundles.get('dsh-scaffold-checks').enabled,
+      true,
+      'the scaffold that is still associated must keep running',
+    );
+
+    const listed = await operations.execute({ action: 'list' });
+    const record = listed.workspaces.find((row) => row.workspaceId === workspace.workspaceId);
+    assert.equal(record.bindings.length, 1);
+    assert.equal(record.bindings[0].packageName, 'dsh-scaffold-checks');
+    assert.equal(record.ready, true);
+    assert.equal(checks.binding.bindingId !== undefined, true);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('unbinding never disables a scaffold another workspace still needs', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const one = await fake.workspace.add(join(fake.workspace.root, 'holder-one'), 'one');
+    const two = await fake.workspace.add(join(fake.workspace.root, 'holder-two'), 'two');
+    const directory = await notesPackage(fake.workspace.root);
+    const first = await bindPackage(operations, one.workspaceId, directory);
+    await bindPackage(operations, two.workspaceId, directory);
+    await write(operations, { action: 'wake', workspaceId: one.workspaceId });
+    await write(operations, { action: 'wake', workspaceId: two.workspaceId });
+
+    const unbound = await write(operations, {
+      action: 'unbind',
+      workspaceId: one.workspaceId,
+      bindingId: first.binding.bindingId,
+    });
+    assert.deepEqual(unbound.release.released, []);
+    assert.equal(unbound.release.kept[0].reason, 'other-workspace');
+    assert.deepEqual(unbound.release.kept[0].holders, [two.workspaceId]);
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('unbinding a disabled association changes no native state', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'opt-out'), 'opt-out');
+    const directory = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: directory });
+    const binding = await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+      enabled: false,
+    });
+    const unbound = await write(operations, {
+      action: 'unbind',
+      workspaceId: workspace.workspaceId,
+      bindingId: binding.bindingId,
+    });
+    assert.deepEqual(unbound.release.released, []);
+    assert.deepEqual(unbound.release.kept, []);
+    assert.equal(fake.calls.filter((call) => call.kind === 'setBundleEnabled').length, 0);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('a delayed shelf cannot leave the workspace awake with its bundle off', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'interleaved'), 'interleaved');
+    await bindPackage(operations, workspace.workspaceId, await notesPackage(fake.workspace.root));
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+
+    // Hold the shelf's native disable open, so a shelf and a restore overlap in
+    // a way that is deterministic rather than timing-dependent.
+    let releaseGate;
+    const gate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+    let gateEntered;
+    const entered = new Promise((resolve) => {
+      gateEntered = resolve;
+    });
+    let armed = true;
+    fake.gateSetBundleEnabled(async ({ enabled }) => {
+      if (armed && enabled === false) {
+        armed = false;
+        gateEntered();
+        await gate;
+      }
+    });
+
+    const shelf = write(operations, { action: 'sleep', workspaceId: workspace.workspaceId });
+    // The shelf has now committed `sleeping` and is parked inside its native
+    // disable, still holding the critical section.
+    await entered;
+    const revisionAfterShelf = operations.store.revision;
+    let wakeSettled = false;
+    const wake = write(operations, {
+      action: 'wake',
+      workspaceId: workspace.workspaceId,
+    }).then((value) => {
+      wakeSettled = true;
+      return value;
+    });
+
+    // Give the restore every chance to make its decision while the shelf is
+    // still parked. A working critical section prevents it entirely, so this
+    // waits out the bound; the broken version commits here instead.
+    await waitForEvent(() => wakeSettled || operations.store.revision !== revisionAfterShelf, 400);
+    releaseGate();
+    await Promise.allSettled([shelf, wake]);
+    fake.gateSetBundleEnabled(null);
+
+    // The invariant the interleaving used to break: whatever the declared intent
+    // ended up being, the native state has to agree with it.
+    const listed = await operations.execute({ action: 'list' });
+    const record = listed.workspaces.find((row) => row.workspaceId === workspace.workspaceId);
+    const enabled = fake.bundles.get('dsh-scaffold-notes').enabled;
+    assert.equal(
+      enabled,
+      record.requestedState === 'awake',
+      `requestedState=${record.requestedState} must agree with native enabled=${enabled}`,
+    );
+    assert.equal(record.ready, record.requestedState === 'awake');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+/**
+ * Wait until an observable event happens, or give up after a bound.
+ *
+ * Interleaving tests need to know that another operation has *reached a
+ * decision*, not merely that some time passed. Polling a real condition
+ * (a settled promise, a revision change) keeps that deterministic; the bound
+ * only exists so the case where the event is correctly prevented can finish.
+ * @param {() => boolean} predicate
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>} Whether the event happened before the bound.
+ */
+async function waitForEvent(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 test('a stale revision is refused even when the action would have been a no-op', async () => {
   const { fake, operations } = await setup();
   try {

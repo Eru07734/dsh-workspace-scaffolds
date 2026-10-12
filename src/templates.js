@@ -10,7 +10,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import { Fault, CODES } from './errors.js';
 import { MAX_RENDER_BYTES } from './scaffold.js';
-import { newId, resolveInside, sha256Hex, writeFileAtomic } from './util.js';
+import { newId, resolveInsideReal, sha256Hex, writeFileAtomic } from './util.js';
 
 /** Bytes of text shown in a preview payload. */
 const PREVIEW_TEXT_BYTES = 4096;
@@ -147,7 +147,10 @@ export async function buildPreview(input) {
   const files = [];
   const blocking = [];
   for (const file of await renderTemplate(input.descriptor, input.template, input.values)) {
-    const absolute = resolveInside(input.workspaceRoot, file.target);
+    // Both the spelling and the filesystem location must be inside the
+    // workspace: `linked/output.txt` can be literally inside while a junction
+    // puts the real file elsewhere.
+    const absolute = await resolveInsideReal(input.workspaceRoot, file.target);
     const current = await inspectPath(absolute);
     const digest = sha256Hex(file.bytes);
     let status = 'create';
@@ -210,7 +213,9 @@ export async function applyPreview(input) {
   const created = [];
   const skipped = [];
   for (const file of files) {
-    const absolute = resolveInside(input.preview.workspaceRoot, file.target);
+    // Re-proved here, not just at preview time: a directory can be replaced by
+    // a link between the preview and this write.
+    const absolute = await resolveInsideReal(input.preview.workspaceRoot, file.target);
     const current = await inspectPath(absolute);
     if (current.exists) {
       if (current.isDirectory) throw new Fault(CODES.templateConflict, { target: file.target, reason: 'existing-directory' });
