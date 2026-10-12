@@ -313,6 +313,7 @@ d3fa6c6d2398d7c4d69b1e62e67ffa8929874ab1fc3b75f8706bdf4a3436d034
 6. 客户端 bundle 的更新与热加载行为：本插件是普通 bundle，改动需要重新安装并刷新页面。**仍未验证。**
 7. ~~**重启后的状态对账**~~ —— **已验证**（9/9，见 §隔离实例验证 §重启对账）。
 8. 与具体 DSH 版本升级后的兼容性。**仍未验证**（本插件只在 0.2.0-rc.2 上实测过；0.1.x 到 0.2.0 的 DSH 升级路径未测）。
+9. ~~**agent 层：脚手架注册的工具对模型真实可用**~~ —— **已验证**（12/12，见 §agent 层验证）。
 
 ## 隔离实例验证（2026-10-12）
 
@@ -363,7 +364,47 @@ PASS  对账没有把任何包钉住（pinned: false）
 PASS  启用状态与重启前一致
 ```
 
-### 一处方法论教训：什么算"干净起点"
+### agent 层验证：12/12 通过
+
+这是唯一无法用 HTTP 或假宿主证明的一环：bundle 被启用，不等于它注册的工具真的进了**模型的工具列表**。所以在隔离实例里跑了一次真实 agent 回合。
+
+```
+A1  提问前 bundle 确实已启用（wake 生效、原生启用、未被钉住）      3/3
+A2  创建会话并把提示交给 agent                                     2/2
+A3  真实回合跑完，模型给出了回答                                    5/5
+A4  消息记录里确实有工具调用与它的返回载荷                          2/2
+```
+
+关键读数（`session/projections` 的实时投影）：
+
+```json
+{ "turnOutline": [ { "turn": 1,
+    "response": "TOOL_NAME=project_checklist CHECKLIST_KEYS=ok, value" } ],
+  "sessionStats": { "turns": 1, "steps": 2, "toolMs": 15 },
+  "contextBreakdown": { "toolsTokens": 6309 } }
+```
+
+- `toolsTokens: 6309` —— 模型确实拿到了一份非空的工具列表。
+- `steps: 2` 且 `toolMs: 15` —— 中间发生了一次真实的工具调用。
+- 消息记录里出现了 `topLevelEntries` —— 那是**这个工具自己的返回字段**，只有它真的执行了才会存在。仅凭「模型说它调用了」不足以证明，这个字段才是硬证据。
+
+**踩到的两个坑，都值得记下来：**
+
+1. **`session/prompt` 的请求形状猜不出来。** 我按 ACP 的形状（`{sessionId, prompt:[...]}`）试了八种组合全部被网关拒绝。最后从解包出的描述符里读到真实定义：
+
+   ```
+   SessionPromptRequest { requestId, sessionId, mode: 'queue'|'steer', content: PromptContentPart[] }
+   ```
+
+   字段是 `content` 而不是 `prompt`，还必需 `requestId` 与 `mode`。**遇到 gateway 边界校验失败时应去读描述符，而不是继续猜字段。**
+
+2. **读会话记录不能读磁盘文件。** 我第一次用 `sessions/**/session.v4.jsonl.zstd` 读，解压后只有 226 字节的会话头，于是误判成「回合根本没跑」。实际上回合**已经跑完**（`turnOutline` 里有完整回答）——会话文件只在 flush 时落盘，实时视图在 `session/projections`。
+
+   如果我当时就此收手，就会把一个**已经通过的验证**误报成失败。
+
+### 一处方法论教训：什么算「干净起点」
+
+
 
 第一次跑 V1–V9 时出现了 11 项失败，一度看起来像缺陷 4/5 的修复失效（`wake` 后 `pinned=true`）。实际原因是我**只清了插件的状态，没有清原生的启用状态**：两个示例 bundle 仍是 enabled，于是导入时**正确地**判定为 `external` + `pinned`，后续休眠自然全被挡下。
 
