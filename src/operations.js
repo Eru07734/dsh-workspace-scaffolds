@@ -15,6 +15,7 @@ import { readScaffoldDescriptor, summarizeDescriptor } from './scaffold.js';
 import { readBindRequest } from './schema.js';
 import { applyPreview, buildPreview, resolveVariables, selectTemplate } from './templates.js';
 import { jsonSafe } from './store.js';
+import { Progress } from './progress.js';
 import { ownIdentity, restartPending } from './version.js';
 import {
   canonicalize,
@@ -30,7 +31,7 @@ import {
 } from './util.js';
 
 /** Actions that never change configuration. */
-export const READ_ACTIONS = new Set(['list', 'operation-status', 'scaffolds']);
+export const READ_ACTIONS = new Set(['list', 'operation-status', 'scaffolds', 'progress']);
 /** Actions that mutate configuration and therefore require a revision guard. */
 export const WRITE_ACTIONS = new Set([
   'import',
@@ -46,6 +47,20 @@ export const WRITE_ACTIONS = new Set([
 
 /** Everything the plugin accepts. */
 export const ACTIONS = new Set([...READ_ACTIONS, ...WRITE_ACTIONS, 'template-preview', 'reconcile']);
+
+/**
+ * Actions slow enough that a caller needs something to watch. These are the
+ * ones that run a package manager or perform several native enablements.
+ */
+export const TRACKED_ACTIONS = new Set(['import', 'wake', 'sleep', 'template-apply']);
+
+/** The steps each tracked action is expected to run, in order. */
+const PLAN = {
+  import: ['validate package', 'hash and archive', 'read scaffold descriptor', 'install without enabling', 'record in warehouse'],
+  wake: ['plan packages', 'enable packages', 'commit intent'],
+  sleep: ['plan release', 'release packages'],
+  'template-apply': ['re-render and verify', 'create files'],
+};
 
 /**
  * The caller-supplied arguments of one request, without the bookkeeping fields.
@@ -83,6 +98,8 @@ export class Operations {
     this.sleepQueue = null;
     /** Whether `agent/created` may attempt a restore. Updated by the caller after probing. */
     this.automaticRestore = 'enabled';
+    /** Live and recent operation progress, exposed over HTTP while work runs. */
+    this.progress = new Progress();
   }
 
   /** Wire the deferred-sleep queue to this instance. */
@@ -234,6 +251,22 @@ export class Operations {
         });
       }
     }
+    if (request.background === true && TRACKED_ACTIONS.has(action)) {
+      // Long work over HTTP: answer immediately with the id to poll, rather than
+      // holding the connection open through a package-manager run. `#dispatch`
+      // synchronously registers its progress entry before its first await, so
+      // the entry already exists by the time this returns.
+      void this.#dispatch(action, request)
+        .catch(() => {})
+        .finally(() => {});
+      return {
+        operationId: request.operationId,
+        action,
+        status: 'running',
+        background: true,
+        progress: await this.#progressFor(request.operationId),
+      };
+    }
     try {
       return await this.#dispatch(action, request);
     } finally {
@@ -242,12 +275,52 @@ export class Operations {
   }
 
   /**
-   * Route one validated action to its handler.
+   * @param {string} operationId
+   * @returns {Promise<object|null>}
+   */
+  async #progressFor(operationId) {
+    return this.progress.get(operationId);
+  }
+
+  /**
+   * Route one validated action to its handler, tracking progress for the
+   * actions that take real time.
    * @param {string} action
    * @param {object} request
    * @returns {Promise<any>}
    */
   async #dispatch(action, request) {
+    if (!TRACKED_ACTIONS.has(action)) return await this.#route(action, request, null);
+
+    const operationId = request.operationId;
+    this.progress.begin(operationId, action, PLAN[action]);
+    const report = {
+      activate: (label) => this.progress.activate(operationId, label),
+      complete: (label, outcome) => this.progress.complete(operationId, label, outcome),
+      addStep: (label) => this.progress.addStep(operationId, label),
+      phase: (text) => this.progress.phase(operationId, text),
+    };
+    try {
+      const value = await this.#route(action, request, report);
+      this.progress.finish(operationId, { ok: true, result: summarizeProgressResult(value) });
+      return value;
+    } catch (error) {
+      this.progress.finish(operationId, {
+        ok: false,
+        code: error instanceof Fault ? error.code : CODES.nativeOperationFailed,
+        details: error instanceof Fault ? error.details : { message: error instanceof Error ? error.message : String(error) },
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * @param {string} action
+   * @param {object} request
+   * @param {{activate: Function, complete: Function, addStep: Function, phase: Function}|null} report
+   * @returns {Promise<any>}
+   */
+  async #route(action, request, report) {
     switch (action) {
       case 'list':
         return await this.#list();
@@ -255,8 +328,10 @@ export class Operations {
         return await this.#scaffolds(request);
       case 'operation-status':
         return this.#operationStatus(request);
+      case 'progress':
+        return this.#progress(request);
       case 'import':
-        return await this.#import(request);
+        return await this.#import(request, report);
       case 'bind':
         return await this.#bind(request);
       case 'unbind':
@@ -266,13 +341,13 @@ export class Operations {
       case 'set-pin':
         return await this.#setPin(request);
       case 'wake':
-        return await this.#wake(request);
+        return await this.#wake(request, report);
       case 'sleep':
-        return await this.#sleep(request);
+        return await this.#sleep(request, report);
       case 'template-preview':
         return await this.#templatePreview(request);
       case 'template-apply':
-        return await this.#templateApply(request);
+        return await this.#templateApply(request, report);
       case 'delete-archive':
         return await this.#deleteArchive(request);
       case 'reconcile':
@@ -391,6 +466,9 @@ export class Operations {
       recoveryNote: this.store.recoveryNote,
       runningAgents: this.activity.busy(),
       pendingSleeps: this.sleepQueue?.workspaces() ?? [],
+      // Included so a single poll answers "what is it doing right now" as well
+      // as "what is the state"; a progress view needs no second request.
+      progress: this.progress.snapshot(),
       capabilities: {
         pluginManager: this.host.hasPluginManager(),
         workspaceRegistry: this.host.hasWorkspaceRegistry(),
@@ -472,10 +550,35 @@ export class Operations {
   }
 
   /** @param {object} request @returns {object} */
+  #progress(request) {
+    if (typeof request.operationId === 'string' && request.operationId.length > 0) {
+      const entry = this.progress.get(request.operationId);
+      if (entry === null) throw new Fault(CODES.packageUnknown, { operationId: request.operationId, reason: 'unknown-operation' });
+      return { operation: entry };
+    }
+    return this.progress.snapshot();
+  }
+
+  /** @param {object} request @returns {object} */
   #operationStatus(request) {
     const operationId = request.operationId;
     if (typeof operationId !== 'string' || operationId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'operationId' });
+    }
+    // A running operation has no durable log entry yet, so consult the live
+    // progress first; otherwise polling a long import would report "unknown"
+    // for exactly as long as the caller needs to watch it.
+    const live = this.progress.get(operationId);
+    if (live !== null) {
+      return {
+        operationId,
+        action: live.action,
+        status: live.status === 'running' ? 'running' : live.status === 'succeeded' ? 'committed' : 'failed',
+        result: live.result,
+        error: live.error,
+        at: live.updatedAt,
+        progress: live,
+      };
     }
     const record = this.store.operation(operationId);
     if (record === null) throw new Fault(CODES.packageUnknown, { operationId, reason: 'unknown-operation' });
@@ -485,7 +588,7 @@ export class Operations {
       status: record.status,
       result: record.result,
       at: record.at,
-      pendingSleep: (this.sleepQueue?.workspaces() ?? []).includes(operationId) ? null : undefined,
+      progress: null,
     };
   }
 
@@ -495,12 +598,13 @@ export class Operations {
    * @param {object} request
    * @returns {Promise<object>}
    */
-  async #import(request) {
+  async #import(request, report) {
     const args = { path: request.path, install: request.install !== false };
     if (typeof args.path !== 'string' || args.path.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'path' });
     }
 
+    report?.activate('validate package');
     const imported = await importFromPath(this.store, args.path);
     const key = packageKey(imported.name, imported.version);
     const existing = this.store.snapshot().packages[key] ?? null;
@@ -511,20 +615,29 @@ export class Operations {
         importedSha256: imported.archiveSha256,
       });
     }
+    report?.complete('validate package', { detail: `${imported.name}@${imported.version}` });
+    report?.complete('hash and archive', { detail: imported.archiveSha256.slice(0, 12) });
 
     // Read the descriptor from the snapshot's own bytes, before anything is
     // installed, so an invalid scaffold is refused without touching the profile.
+    report?.activate('read scaffold descriptor');
     const descriptor = await this.#descriptorFromArchive(imported.archiveSha256);
+    report?.complete('read scaffold descriptor', {
+      detail: descriptor === null ? 'no templates' : `${descriptor.templates.length} template(s)`,
+    });
+
     const bundles = await readBundles(this.host).catch(() => new Map());
     const before = evaluatePackage(bundles, imported.name, imported.version);
     let installOutcome = 'skipped';
     if (args.install !== false && before.status === 'absent') {
+      report?.activate('install without enabling');
       const result = await this.#nativeWrite(null, () =>
         this.host.installBundle(archivePath(this.store, imported.archiveSha256), {
           requestId: request.operationId,
         }),
       );
       installOutcome = typeof result?.application === 'string' ? result.application : 'installed';
+      report?.complete('install without enabling', { detail: installOutcome });
     } else if (before.status === 'mismatch') {
       throw new Fault(CODES.versionConflict, {
         packageName: imported.name,
@@ -533,7 +646,9 @@ export class Operations {
       });
     } else if (before.status === 'match') {
       installOutcome = 'already-installed';
+      report?.complete('install without enabling', { status: 'skipped', detail: 'already installed' });
     }
+    report?.activate('record in warehouse');
 
     const after = evaluatePackage(await readBundles(this.host).catch(() => before), imported.name, imported.version);
     const committed = await this.store.mutate(
@@ -566,6 +681,7 @@ export class Operations {
         };
       },
     );
+    report?.complete('record in warehouse', { detail: key });
     return committed.value;
   }
 
@@ -795,13 +911,15 @@ export class Operations {
    * @param {object} request `{workspaceId, install?, fast?}`
    * @returns {Promise<object>}
    */
-  async #wake(request) {
+  async #wake(request, report) {
     const args = { workspaceId: request.workspaceId, install: request.install !== false, fast: request.fast === true };
     if (typeof args.workspaceId !== 'string' || args.workspaceId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'workspaceId' });
     }
     this.sleepQueue?.cancel(args.workspaceId);
-    const outcome = await this.#enableForWorkspace(args.workspaceId, args);
+    report?.activate('plan packages');
+    const outcome = await this.#enableForWorkspace(args.workspaceId, args, report);
+    report?.activate('commit intent');
     const committed = await this.store.mutate(
       { action: 'wake', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
       (draft) => {
@@ -812,6 +930,7 @@ export class Operations {
         return outcome;
       },
     );
+    report?.complete('commit intent', { detail: `revision ${committed.revision}` });
     return committed.value;
   }
 
@@ -821,9 +940,10 @@ export class Operations {
    * newly enabled before rethrowing.
    * @param {string} workspaceId
    * @param {{install: boolean, fast: boolean}} options
+   * @param {{addStep: Function, activate: Function, complete: Function}|null} [report]
    * @returns {Promise<object>}
    */
-  async #enableForWorkspace(workspaceId, options) {
+  async #enableForWorkspace(workspaceId, options, report = null) {
     const state = this.store.snapshot();
     if (state.workspaces[workspaceId] === undefined) {
       throw new Fault(CODES.workspaceNotFound, { workspaceId });
@@ -837,6 +957,10 @@ export class Operations {
         let bundles = await readBundles(this.host);
         let evaluated = evaluatePackage(bundles, step.packageName, step.version);
         const record = state.packages[step.key] ?? null;
+        report?.addStep(`enable ${step.packageName}`);
+        if (evaluated.enabled) {
+          report?.complete(`enable ${step.packageName}`, { status: 'skipped', detail: 'already enabled' });
+        }
 
         if (evaluated.status === 'mismatch') {
           const fault = new Fault(CODES.versionConflict, {
@@ -887,12 +1011,17 @@ export class Operations {
         }
         if (evaluated.enabled) {
           applied.push({ key: step.key, application: 'already-enabled' });
+          report?.complete(`enable ${step.packageName}`, { status: 'skipped', detail: 'already enabled' });
           continue;
         }
         const result = await this.#nativeWrite({ key: step.key, enabled: true }, () => this.host.setBundleEnabled(step.packageName, true));
         const application = typeof result?.application === 'string' ? result.application : 'applied';
         newlyEnabled.push(step.packageName);
         applied.push({ key: step.key, application, warnings: jsonSafe(result?.warnings ?? null) });
+        report?.complete(`enable ${step.packageName}`, {
+          status: application === 'failed' || application === 'cancelled' ? 'failed' : 'done',
+          detail: application,
+        });
         if (application === 'failed' || application === 'cancelled') {
           const fault = new Fault(CODES.nativeOperationFailed, {
             packageName: step.packageName,
@@ -960,7 +1089,7 @@ export class Operations {
    * @param {object} request
    * @returns {Promise<object>}
    */
-  async #sleep(request) {
+  async #sleep(request, report) {
     const args = { workspaceId: request.workspaceId };
     if (typeof args.workspaceId !== 'string' || args.workspaceId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'workspaceId' });
@@ -970,6 +1099,7 @@ export class Operations {
       return { workspaceId: args.workspaceId, status: 'no-op', reason: 'unassociated' };
     }
     const busy = this.activity.busy();
+    report?.activate('plan release');
     const committed = await this.store.mutate(
       { action: 'sleep', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
       (draft) => {
@@ -981,9 +1111,11 @@ export class Operations {
     );
     if (busy) {
       const queued = this.sleepQueue.enqueue(args.workspaceId);
+      report?.complete('plan release', { status: 'skipped', detail: 'deferred until idle' });
       return { ...committed.value, queued, release: null };
     }
-    const release = await this.#releaseForWorkspace(args.workspaceId, 'immediate');
+    report?.complete('plan release', { detail: 'immediate' });
+    const release = await this.#releaseForWorkspace(args.workspaceId, 'immediate', report);
     return { ...committed.value, release };
   }
 
@@ -1009,13 +1141,15 @@ export class Operations {
    * @param {string} trigger
    * @returns {Promise<object>}
    */
-  async #releaseForWorkspace(workspaceId, trigger) {
+  async #releaseForWorkspace(workspaceId, trigger, report = null) {
     const state = this.store.snapshot();
     if (state.workspaces[workspaceId] === undefined) {
       return { trigger, released: [], kept: [], failed: [] };
     }
     const plan = planSleep(state, workspaceId);
-    const released = await this.#releaseKeys(plan.release, trigger);
+    report?.activate('release packages');
+    for (const key of plan.release) report?.addStep(`disable ${parsePackageKey(key).name}`);
+    const released = await this.#releaseKeys(plan.release, trigger, report);
     if (trigger !== 'immediate') {
       // Deferred work is not part of the caller's operation, so it gets its own
       // log entry rather than silently mutating state outside the log.
@@ -1037,7 +1171,7 @@ export class Operations {
    * @param {string} trigger
    * @returns {Promise<{released: object[], failed: object[]}>}
    */
-  async #releaseKeys(keys, trigger) {
+  async #releaseKeys(keys, trigger, report = null) {
     const bundles = await readBundles(this.host).catch(() => new Map());
     const released = [];
     const failed = [];
@@ -1046,17 +1180,23 @@ export class Operations {
       const row = bundles.get(name);
       if (row === undefined || row.enabled !== true) {
         released.push({ key, outcome: 'already-off' });
+        report?.complete(`disable ${name}`, { status: 'skipped', detail: 'already off' });
         continue;
       }
       try {
         const result = await this.#nativeWrite({ key, enabled: false }, () => this.host.setBundleEnabled(name, false));
         const application = typeof result?.application === 'string' ? result.application : 'applied';
         released.push({ key, outcome: application });
+        report?.complete(`disable ${name}`, {
+          status: application === 'failed' || application === 'cancelled' ? 'failed' : 'done',
+          detail: application,
+        });
         if (application === 'failed' || application === 'cancelled') {
           failed.push({ key, message: `native manager reported ${application}` });
         }
       } catch (error) {
         failed.push({ key, message: error instanceof Error ? error.message : String(error) });
+        report?.complete(`disable ${name}`, { status: 'failed', detail: error instanceof Error ? error.message : String(error) });
       }
     }
     void trigger;
@@ -1108,7 +1248,7 @@ export class Operations {
    * @param {object} request
    * @returns {Promise<object>}
    */
-  async #templateApply(request) {
+  async #templateApply(request, report) {
     const args = { previewId: request.previewId };
     if (typeof args.previewId !== 'string' || args.previewId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'previewId' });
@@ -1122,13 +1262,20 @@ export class Operations {
     if (workspace === undefined) throw new Fault(CODES.workspaceNotFound, { workspaceId: preview.workspaceId });
     const binding = workspace.bindings.find((entry) => entry.id === preview.bindingId);
     if (binding === undefined) throw new Fault(CODES.invalidRequest, { field: 'bindingId', reason: 'unknown-binding' });
+    report?.activate('re-render and verify');
     const descriptor = await this.#descriptorOf(binding.packageName, binding.version);
     const template = selectTemplate(descriptor, preview.templateId);
     const root = await this.#workspaceRoot(preview.workspaceId, workspace);
     if (root !== preview.workspaceRoot) {
       throw new Fault(CODES.previewStale, { reason: 'workspace-path-changed', was: preview.workspaceRoot, now: root });
     }
+    report?.complete('re-render and verify', { detail: `${preview.files.length} file(s)` });
+    report?.activate('create files');
+    for (const file of preview.files) report?.addStep(`write ${file.path}`);
     const outcome = await applyPreview({ preview: { ...preview, files: preview.files }, descriptor, template });
+    for (const file of preview.files) {
+      report?.complete(`write ${file.path}`, { detail: file.action ?? 'create' });
+    }
     const committed = await this.store.mutate(
       { action: 'template-apply', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
       (draft) => {
@@ -1301,4 +1448,40 @@ function publicDescriptor(descriptor) {
       files: template.files.map((file) => ({ target: file.target, render: file.render })),
     })),
   };
+}
+
+
+/**
+ * A compact, JSON-safe summary of an operation's outcome, for the progress
+ * record. The full result can be large; this keeps only the fields a progress
+ * view shows, so polling stays cheap.
+ * @param {any} value
+ * @returns {any}
+ */
+function summarizeProgressResult(value) {
+  if (value === null || typeof value !== 'object') return value ?? null;
+  const summary = {};
+  for (const field of [
+    'workspaceId',
+    'status',
+    'reason',
+    'packageKey',
+    'packageName',
+    'version',
+    'installOutcome',
+    'templateId',
+    'steps',
+    'applied',
+    'failures',
+    'released',
+    'kept',
+    'failed',
+    'created',
+    'skipped',
+    'queued',
+    'release',
+  ]) {
+    if (value[field] !== undefined) summary[field] = value[field];
+  }
+  return jsonSafe(summary);
 }

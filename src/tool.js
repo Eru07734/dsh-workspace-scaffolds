@@ -27,7 +27,7 @@ const parameters = {
     action: { type: 'string', enum: [...ACTIONS].sort() },
     workspaceId: { description: 'Target workspace id. Omit to use the calling session\'s own workspace.' },
     expectedRevision: { type: 'integer', description: 'Required for write actions; the revision returned by `list`.' },
-    operationId: { type: 'string', description: 'Required for write actions; a fresh UUID. Reusing it with identical arguments replays the recorded result instead of repeating the work.' },
+    operationId: { type: 'string', description: 'Required for write actions; a fresh UUID. Reusing it with identical arguments replays the recorded result instead of repeating the work. For progress, pass one to report only that operation.' },
     path: { description: 'For import: absolute path to a scaffold package directory or .tgz file.' },
     install: { description: 'For import/wake: whether the native package manager may install the stored snapshot. Defaults to true.' },
     packageName: { type: 'string' },
@@ -44,6 +44,11 @@ const parameters = {
     templateValues: { type: 'object', additionalProperties: true },
     values: { type: 'object', additionalProperties: true },
     previewId: { type: 'string' },
+    background: {
+      type: 'boolean',
+      description:
+        'For import/wake/sleep/template-apply: return as soon as the work starts instead of waiting for it, then follow it with action=progress. Useful when the call would otherwise run long enough to time out.',
+    },
   },
   required: ['action'],
 };

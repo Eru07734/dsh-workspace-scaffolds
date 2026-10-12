@@ -58,7 +58,7 @@
 # 在 DSH 中通过插件管理器安装本目录或发行包
 dsh plugin add /absolute/path/to/dsh-workspace-scaffolds
 # 或安装打包好的发行包
-dsh plugin add ./dsh-workspace-scaffolds-0.1.6.tgz
+dsh plugin add ./dsh-workspace-scaffolds-0.1.7.tgz
 ```
 
 安装后需要为本插件启用 bundle（默认 `cordis.patch.yml` 已声明）。面板出现在 **插件页 → 本插件卡片**，使用 `plugins.bundle.config` 插槽。
@@ -137,12 +137,59 @@ dsh plugin add ./dsh-workspace-scaffolds-0.1.6.tgz
 
 ```
 GET  /api/workspace-scaffolds/state
+GET  /api/workspace-scaffolds/progress            # 只读进度，适合高频轮询
+GET  /api/workspace-scaffolds/progress?operationId=<id>
 POST /api/workspace-scaffolds/execute
 ```
 
 成功：`{ "ok": true, "value": ... }`；失败：`{ "ok": false, "code": "...", "details": { ... } }`。
 
 请求体上限 1 MiB。配置、版本、模板冲突返回 409，输入错误 400，找不到 404。
+
+### 进度
+
+`import` 会真的跑包管理器，`wake` 要逐个原生启用 bundle；这些请求在完成前如果不返回任何中间信息，调用方就只看到一个卡住的连接。因此耗时的动作会被登记成一条**进度记录**，可以在它还在跑的时候查询：
+
+```jsonc
+// POST /execute  { "action": "import", ..., "background": true }
+{ "ok": true, "value": {
+    "operationId": "…", "action": "import", "status": "running", "background": true,
+    "progress": { "phase": "validate package", "steps": [ /* … */ ] } } }
+```
+
+```jsonc
+// GET /progress        （或包含在 GET /state 的 progress 字段里，一次轮询即可）
+{ "ok": true, "value": {
+    "running": [ {
+      "operationId": "…", "action": "import", "status": "running",
+      "phase": "install without enabling",
+      "steps": [
+        { "label": "validate package", "status": "done", "detail": "dsh-scaffold-notes@0.1.0" },
+        { "label": "install without enabling", "status": "active" },
+        { "label": "record in warehouse", "status": "pending" }
+      ] } ],
+    "recent": [ /* 最近完成的，保留 20 条 */ ] } }
+```
+
+实际轮询效果（真实输出，`install` 被注入 1.2s 延迟以便观察）：
+
+```
+tick 2
+  import  running  phase=install without enabling
+      [x] validate package  (dsh-scaffold-notes@0.1.0)
+      [x] hash and archive  (8700a0a14de3)
+      [x] read scaffold descriptor  (1 template(s))
+      [>] install without enabling
+      [ ] record in warehouse
+```
+
+要点：
+
+- **`background: true`** 让耗时动作立刻返回 `operationId`，而不是把连接挂到跑完为止；配合 `/progress` 轮询即可。适用于 `import`、`wake`、`sleep`、`template-apply`。
+- 步骤状态为 `pending` / `active` / `done` / `failed` / `skipped`；`wake` 与 `sleep` 会按包**动态追加**步骤（每个包一行），因为这些步骤在计划时就已确定但数量取决于关联。
+- 进度**只在内存中**，刻意不持久化：它描述的是一个活着的进程，重启后读到过期记录比读不到更糟。持久的结果仍在操作日志里（`operation-status`）。
+- `operation-status` 对**进行中**的操作同样可用（读实时进度），不必等它写入操作日志。
+- 面板在动作执行期间轮询 `/progress` 并逐步渲染，而不是只显示一个转圈。
 
 ### 构建标识
 
@@ -211,7 +258,7 @@ node --test test/*.test.mjs
 
 | 验证了什么 | 没验证什么 |
 |---|---|
-| 88 项 `node:test` 用例全部通过 | 浏览器面板的真实渲染与交互 |
+| 102 项 `node:test` 用例全部通过 | 浏览器面板的真实渲染与交互 |
 | Linux（Node 22 / 24）与 Windows 上均通过 | 浏览器面板的真实渲染与交互 |
 | 真实 `src/host.js` 适配层被实际执行（非桩替换） | 重启后的状态对账 |
 | **已在真实 DSH 中热载入并响应接口**（见 docs/verification.md） | 与具体 DSH 版本升级后的兼容性 |

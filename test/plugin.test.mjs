@@ -63,15 +63,17 @@ test('the plugin declares a stable name and the services it cannot run without',
   assert.deepEqual(inject, ['connection', 'tools']);
 });
 
-test('apply mounts both routes, the tool, and the lifecycle listeners', async () => {
+test('apply mounts the routes, the tool, and the lifecycle listeners', async () => {
   const fake = await createFakeHost();
   try {
     const mounted = mount(fake);
     assert.deepEqual(
       mounted.routes.map((route) => route.path).sort(),
-      [`${API_PREFIX}/execute`, `${API_PREFIX}/state`],
+      [`${API_PREFIX}/execute`, `${API_PREFIX}/progress`, `${API_PREFIX}/state`],
     );
     assert.equal(mounted.routes.find((route) => route.path.endsWith('/execute')).methods[0], 'POST');
+    // Progress is readable with a plain GET so a viewer can poll it cheaply.
+    assert.equal(mounted.routes.find((route) => route.path.endsWith('/progress')).methods[0], 'GET');
     assert.equal(mounted.tools.length, 1);
     assert.equal(mounted.tools[0].name, TOOL_NAME);
     assert.ok(mounted.provided.has('workspaceScaffolds'));

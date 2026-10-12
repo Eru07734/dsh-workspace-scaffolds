@@ -51,6 +51,23 @@ export function mountHttp(ctx, operations) {
 
   register('/state', ['GET'], async () => await operations.execute({ action: 'list' }), 'state');
 
+  /**
+   * Progress only, for cheap polling while a long call is in flight. The full
+   * `/state` payload is heavier and would make a progress view re-render
+   * everything on every tick.
+   */
+  register(
+    '/progress',
+    ['GET'],
+    async (request) => {
+      const operationId = new URL(request.url).searchParams.get('operationId');
+      return await operations.execute(
+        operationId === null ? { action: 'progress' } : { action: 'progress', operationId },
+      );
+    },
+    'progress',
+  );
+
   register(
     '/execute',
     ['POST'],

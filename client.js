@@ -16,6 +16,14 @@ window.__ModuleLoader__.load({
       revision: '配置版本',
       version: '版本',
       versionUnknown: '未知',
+      stepPending: '等待',
+      stepActive: '进行中',
+      stepDone: '已完成',
+      stepFailed: '失败',
+      stepSkipped: '已跳过',
+      status_running: '进行中',
+      status_succeeded: '已完成',
+      status_failed: '失败',
       profileSpec: 'profile 声明',
       restartPending: 'profile 请求的版本与内存中运行的构建不同，需要重启 DSH 才能生效。',
       capabilityMissing: '原生插件管理器不可用，只能查看已保存的关联。',
@@ -100,6 +108,14 @@ window.__ModuleLoader__.load({
       revision: 'Revision',
       version: 'Version',
       versionUnknown: 'unknown',
+      stepPending: 'waiting',
+      stepActive: 'running',
+      stepDone: 'done',
+      stepFailed: 'failed',
+      stepSkipped: 'skipped',
+      status_running: 'running',
+      status_succeeded: 'done',
+      status_failed: 'failed',
       profileSpec: 'profile declares',
       restartPending: 'The profile asks for a different build than the one running; restart DSH to apply it.',
       capabilityMissing: 'The native plugin manager is unavailable; saved associations are read-only.',
@@ -197,6 +213,22 @@ window.__ModuleLoader__.load({
 .wsc .wsc-create{color:var(--dsw-alias-state-business-primary)}
 .wsc .wsc-identical{color:var(--dsw-alias-label-secondary)}
 .wsc .wsc-conflict{color:var(--dsw-alias-state-error-primary)}
+.wsc .wsc-progress{margin:10px 0;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
+.wsc .wsc-progress-head{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
+.wsc .wsc-progress-head .wsc-progress-action{font-weight:500}
+.wsc .wsc-progress-head .wsc-progress-phase{color:var(--dsw-alias-label-secondary);font-size:12px}
+.wsc .wsc-progress-steps{list-style:none;margin:0;padding:0;font-size:12px}
+.wsc .wsc-progress-steps li{display:flex;gap:8px;align-items:baseline;padding:2px 0}
+.wsc .wsc-step-mark{width:14px;flex:0 0 14px;text-align:center;color:var(--dsw-alias-label-secondary)}
+.wsc .wsc-step-detail{color:var(--dsw-alias-label-secondary);margin-left:auto;padding-left:10px;font-size:11px;text-align:right}
+.wsc .wsc-step-active .wsc-step-mark{color:var(--dsw-alias-state-business-primary)}
+.wsc .wsc-step-active .wsc-step-label{font-weight:500}
+.wsc .wsc-step-done .wsc-step-mark{color:var(--dsw-alias-state-success-primary)}
+.wsc .wsc-step-failed .wsc-step-mark,.wsc .wsc-step-failed .wsc-step-label{color:var(--dsw-alias-state-error-primary)}
+.wsc .wsc-step-pending .wsc-step-label,.wsc .wsc-step-skipped .wsc-step-label{color:var(--dsw-alias-label-secondary)}
+.wsc .wsc-progress-status-running{color:var(--dsw-alias-state-business-primary)}
+.wsc .wsc-progress-status-succeeded{color:var(--dsw-alias-state-success-primary)}
+.wsc .wsc-progress-status-failed{color:var(--dsw-alias-state-error-primary)}
 `;
 
     /** @returns {string} */
@@ -240,6 +272,7 @@ window.__ModuleLoader__.load({
       const [importPath, setImportPath] = React.useState('');
       const [preview, setPreview] = React.useState(null);
       const [values, setValues] = React.useState({});
+      const [progress, setProgress] = React.useState(null);
 
       const refresh = React.useCallback(async () => {
         try {
@@ -248,7 +281,7 @@ window.__ModuleLoader__.load({
           setError(null);
           return value;
         } catch (failure) {
-          setError({ code: failure.code ?? 'operation-failed', details: failure.details ?? {} });
+          setError({ code: failure.code || 'operation-failed', details: failure.details || {} });
           return null;
         }
       }, []);
@@ -257,12 +290,36 @@ window.__ModuleLoader__.load({
         void refresh();
       }, [refresh]);
 
+      // While an action is in flight the panel would otherwise show a disabled
+      // button and nothing else, even though imports run a package manager and a
+      // wake enables bundles one by one. Poll the live progress so the steps are
+      // visible *during* the work rather than only in its result.
+      React.useEffect(() => {
+        if (!busy) return undefined;
+        let cancelled = false;
+        const tick = async () => {
+          try {
+            const value = await request('/progress');
+            if (!cancelled) setProgress(value);
+          } catch {
+            // Best-effort: the action's own result stays authoritative.
+          }
+        };
+        void tick();
+        const timer = window.setInterval(() => void tick(), 600);
+        return () => {
+          cancelled = true;
+          window.clearInterval(timer);
+        };
+      }, [busy]);
+
       const run = React.useCallback(
         async (body, { confirm: needsConfirm } = {}) => {
           if (needsConfirm !== undefined && !window.confirm(needsConfirm)) return null;
           setBusy(true);
           setError(null);
           setNotice(null);
+          setProgress(null);
           try {
             const snapshot = state ?? (await refresh());
             if (snapshot === null) return null;
@@ -285,14 +342,66 @@ window.__ModuleLoader__.load({
         [state, refresh],
       );
 
-      return { state, error, notice, busy, selected, setSelected, packageKey, setPackageKey, importPath, setImportPath, preview, setPreview, values, setValues, refresh, run, t };
+      return { state, error, notice, busy, selected, setSelected, packageKey, setPackageKey, importPath, setImportPath, preview, setPreview, values, setValues, progress, refresh, run, t };
+    }
+
+    /** The glyph for one step state, paired with a label for screen readers. */
+    function stepMark(t, status) {
+      if (status === 'done') return { glyph: '✔', label: t('stepDone') };
+      if (status === 'active') return { glyph: '▸', label: t('stepActive') };
+      if (status === 'failed') return { glyph: '✖', label: t('stepFailed') };
+      if (status === 'skipped') return { glyph: '–', label: t('stepSkipped') };
+      return { glyph: '·', label: t('stepPending') };
+    }
+
+    /**
+     * Live progress for the running action, and the last finished one when
+     * nothing is running. Steps arrive from `GET /progress`.
+     * @param {object} props
+     */
+    function ProgressView({ t, progress }) {
+      if (progress === null) return null;
+      const running = progress.running ?? [];
+      const shown = running.length > 0 ? running : (progress.recent ?? []).slice(0, 1);
+      if (shown.length === 0) return null;
+
+      return h(
+        'div',
+        { className: 'wsc-progress', 'data-workspace-scaffolds': 'progress' },
+        ...shown.map((entry) =>
+          h(
+            'div',
+            { key: entry.operationId },
+            h(
+              'div',
+              { className: 'wsc-progress-head' },
+              h('span', { className: `wsc-progress-status-${entry.status}` }, t(`status_${entry.status}`)),
+              h('span', { className: 'wsc-progress-action' }, entry.action),
+              h('span', { className: 'wsc-progress-phase' }, entry.error ? entry.error.code : entry.phase),
+            ),
+            h(
+              'ul',
+              { className: 'wsc-progress-steps' },
+              ...(entry.steps ?? []).map((step, index) => {
+                const mark = stepMark(t, step.status);
+                return h(
+                  'li',
+                  { key: `${index}-${step.label}`, className: `wsc-step-${step.status}` },
+                  h('span', { className: 'wsc-step-mark', role: 'img', 'aria-label': mark.label }, mark.glyph),
+                  h('span', { className: 'wsc-step-label' }, step.label),
+                  step.detail ? h('span', { className: 'wsc-step-detail' }, step.detail) : null,
+                );
+              }),
+            ),
+          ),
+        ),
+      );
     }
 
     /** @param {object} props */
     function Page({ t }) {
       const panel = usePanel(t);
       const { state, error, notice, busy } = panel;
-
       if (state === null) {
         return h('div', { className: 'wsc' }, h('style', null, css), h('p', { role: 'status' }, error ? `${t('resultCode')}: ${error.code}` : t('loading')));
       }
@@ -327,6 +436,7 @@ window.__ModuleLoader__.load({
           : null,
         state.capabilities?.pluginManager !== true ? h('p', { className: 'wsc-error' }, t('capabilityMissing')) : null,
         state.capabilities?.workspaceRegistry !== true ? h('p', { className: 'wsc-error' }, t('workspaceMissing')) : null,
+        h(ProgressView, { t, progress: panel.progress }),
         state.recoveryNote ? h('p', { className: 'wsc-error' }, t('recovery')) : null,
         state.automaticRestore === 'degraded' ? h('p', { className: 'wsc-error' }, t('degraded')) : null,
         state.runningAgents ? h('p', { className: 'wsc-hint' }, t('runningAgents')) : null,
