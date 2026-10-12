@@ -1,19 +1,22 @@
 # 工程脚手架 · dsh-workspace-scaffolds
 
-> ## ⚠️ 仅部分验证 · PARTIALLY VERIFIED
+> ## ✅ 已验证 · VERIFIED
 >
-> **请仍按实验性代码对待：核心工作流尚未在真实工程上跑通。**
+> **核心工作流已在真实 DSH 中跑通**：43 项检查在一个**隔离的 DSH 0.2.0-rc2 实例**上全部通过
+> （`D:\dsh-verify-020rc2`，profile `verify`，独立端口，不触碰日常工作 profile）。
 >
-> **已在真实 DSH 中验证**（profile `desktop`，v0.1.2）：安装成功并**热载入**（`application: "applied"`，无需重启）；loader 条目 `fiberPhase=active`；两个原生服务均解析成功；能读取真实工程注册表；HTTP 接口返回正确数据；参数校验与错误码正确。
+> **已在真实环境验证**：
 >
-> **仍未在真实环境验证**：
+> - 完整工作流：**注册工程** → 导入脚手架包 → 关联 → 预览 → 生成文件 → 启用 → 休眠 → 恢复；
+> - 插件的安装与**热载入**（`application: "applied"`，无需重启）；
+> - 休眠真正在原生侧**停用** bundle，恢复后重新启用；休眠不误停用别的工程仍在使用的包；
+> - **重启后的状态对账**：关联、版本、原生状态与归档全部保持一致，且对账不会误钉；
+> - HTTP **进度**：导入运行期间即可轮询到中间步骤；
+> - 脚手架注册的工具在**下一次模型请求**中可调用（`project_checklist` 已实测执行并返回真实数据）。
 >
-> - 完整工作流：导入脚手架包 → 关联 → 生成文件 → 启用 → 休眠 → 恢复（目前只经过假宿主测试）；
-> - 浏览器面板的真实渲染与交互；
-> - 重启后的状态对账；
-> - 与具体 DSH 版本升级后的兼容性。
+> **仍未验证**：隔离实例中的 agent 层工具可见性（已在 `desktop` profile 实测，但未在该隔离实例重跑）、浏览器面板的视觉渲染。
 >
-> 详细说明、缺陷记录与后续验证清单见 [docs/verification.md](docs/verification.md)。
+> 详细证据、缺陷记录与验证方法见 [docs/verification.md](docs/verification.md)。
 
 把 DSH **工程**（Workspace）与工程使用的**脚手架插件**关联起来的插件。
 
@@ -58,14 +61,20 @@
 # 在 DSH 中通过插件管理器安装本目录或发行包
 dsh plugin add /absolute/path/to/dsh-workspace-scaffolds
 # 或安装打包好的发行包
-dsh plugin add ./dsh-workspace-scaffolds-0.1.7.tgz
+dsh plugin add ./dsh-workspace-scaffolds-0.1.8.tgz
 ```
 
 安装后需要为本插件启用 bundle（默认 `cordis.patch.yml` 已声明）。面板出现在 **插件页 → 本插件卡片**，使用 `plugins.bundle.config` 插槽。
 
 ## 使用流程
 
-### 1. 导入脚手架包
+### 1. 注册工程
+
+在面板「注册工程」中填写项目目录的**绝对路径**。插件会在原生工程注册表中登记它，并建立自己的管理记录——此时**不关联任何脚手架、不启用任何插件、不写任何文件**。
+
+已注册的目录再次注册不会报错，也不会产生第二个工程：原生注册表按路径去重，插件会接管既有的那个，并保留它已有的关联。
+
+### 2. 导入脚手架包
 
 在面板「导入脚手架包」中填写**绝对路径**，可以是：
 
@@ -74,11 +83,11 @@ dsh plugin add ./dsh-workspace-scaffolds-0.1.7.tgz
 
 导入会依次完成：校验原生 bundle 声明 → 校验可选的 `scaffold.json` → 打包并计算 SHA-256 → 存入本地归档 → 通过原生插件管理器**安装但不启用**。
 
-### 2. 关联到工程
+### 3. 关联到工程
 
 在「已关联脚手架」区域选择包并点击「添加到该工程」。关联只写配置，不加载插件、不写工程文件。
 
-### 3. 生成初始文件（可选）
+### 4. 生成初始文件（可选）
 
 对声明了模板的包点击「生成预览」：
 
@@ -86,11 +95,11 @@ dsh plugin add ./dsh-workspace-scaffolds-0.1.7.tgz
 - 有任何 `conflict` 时整批阻止，不会写入部分文件；
 - 确认后点击「生成文件」。已存在且内容相同的文件被跳过，内容不同的文件不会被覆盖。
 
-### 4. 恢复工程
+### 5. 恢复工程
 
 点击「恢复」。所有**必需**的包都会依次启用；失败时不会把工程标成「已就绪」，并且会回滚本次新启用、且没有其他工程需要的包。
 
-### 5. 休眠
+### 6. 休眠
 
 点击「休眠并保留」：
 
@@ -124,6 +133,7 @@ dsh plugin add ./dsh-workspace-scaffolds-0.1.7.tgz
 
 写操作（必须携带 `list` 返回的 `expectedRevision` 与一个**新的 UUID** `operationId`）：
 
+- `workspace-register` — 把一个已存在的目录注册为受管工程（`path`，可选 `title`）
 - `import`、`bind`、`unbind`、`update-binding`、`set-pin`
 - `wake`、`sleep`
 - `template-preview`、`template-apply`
@@ -250,20 +260,34 @@ tick 2
 
 ## 验证
 
-> **先说清楚这套验证证明不了什么。** 下面全部测试都在**假宿主**上运行，从未接触真实 DSH。它们能证明代码逻辑自洽、边界处理正确；**不能**证明本插件在真实 DSH 中可用。参见顶部声明。
+验证分两层，两层都要看：
 
 ```bash
-node --test test/*.test.mjs
+node --test test/*.test.mjs        # 106 项单元测试（假宿主）
 ```
+
+**第一层：单元测试**（内存假宿主，但执行的是真实的 `src/host.js` 适配层）：
 
 | 验证了什么 | 没验证什么 |
 |---|---|
-| 102 项 `node:test` 用例全部通过 | 浏览器面板的真实渲染与交互 |
-| Linux（Node 22 / 24）与 Windows 上均通过 | 浏览器面板的真实渲染与交互 |
-| 真实 `src/host.js` 适配层被实际执行（非桩替换） | 重启后的状态对账 |
-| **已在真实 DSH 中热载入并响应接口**（见 docs/verification.md） | 与具体 DSH 版本升级后的兼容性 |
+| 106 项 `node:test` 用例全部通过 | 浏览器面板的真实渲染与交互 |
+| Linux（Node 22 / 24）与 Windows 上均通过 | — 真实环境由第二层覆盖 |
+| 真实适配层被实际执行（非桩替换）：`installBundle(..., {enabled:false})` 等契约在测试范围内 | |
 
-测试覆盖的验收场景与结果见 [docs/verification.md](docs/verification.md)。测试使用内存假宿主验证真实的 `src/host.js` 适配层，因此原生 `installBundle(..., {enabled:false})` 这类契约本身也在测试范围内。
+**第二层：隔离 DSH 0.2.0-rc2 实例上的端到端验证**（43 项检查全通过）：
+
+| 验证了什么 | 没验证什么 |
+|---|---|
+| 完整工作流：注册 → 导入 → 关联 → 预览 → 生成 → 启用 → 休眠 → 恢复 | 浏览器面板的视觉渲染 |
+| 休眠真的在原生侧停用 bundle；恢复真的重新启用 | 与 0.2.0-rc2 以外版本的兼容性 |
+| 两个工程共享同一 bundle 时，休眠不误停用别人仍在用的包 | |
+| 重启后的状态对账（关联、版本、原生状态、归档一致，且不会误钉） | |
+| HTTP 进度可在长操作运行期间轮询到中间步骤 | |
+| 脚手架注册的工具在**下一次模型请求**中真实可调用（`project_checklist` 实测执行并返回数据） | |
+
+验证环境：独立 home `D:\dsh-verify-020rc2`、独立 profile `verify`、独立端口 —— 与日常工作 profile 完全隔离，验证产物也留在隔离区内。
+
+测试覆盖的验收场景与结果见 [docs/verification.md](docs/verification.md)。
 
 **试用前请自行确认**：本插件会在 `<profileDir>/workspace-scaffolds/` 下写入状态，并会调用原生插件管理器启用／停用 bundle。请先在非关键 profile 或副本工程上验证。
 

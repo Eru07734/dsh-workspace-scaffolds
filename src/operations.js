@@ -34,6 +34,7 @@ import {
 export const READ_ACTIONS = new Set(['list', 'operation-status', 'scaffolds', 'progress']);
 /** Actions that mutate configuration and therefore require a revision guard. */
 export const WRITE_ACTIONS = new Set([
+  'workspace-register',
   'import',
   'bind',
   'unbind',
@@ -332,6 +333,8 @@ export class Operations {
         return this.#progress(request);
       case 'import':
         return await this.#import(request, report);
+      case 'workspace-register':
+        return await this.#workspaceRegister(request);
       case 'bind':
         return await this.#bind(request);
       case 'unbind':
@@ -590,6 +593,73 @@ export class Operations {
       at: record.at,
       progress: null,
     };
+  }
+
+  /**
+   * Register an existing directory as a workspace and bring it under management.
+   *
+   * Without this the plugin could only manage workspaces that something else had
+   * already registered, so bringing a project in meant dropping to the native
+   * RPC surface first. It registers natively and creates the management record
+   * with nothing bound and nothing enabled, which is exactly the state a project
+   * is in before its first scaffold.
+   *
+   * Registering a path that is already registered is not an error: the native
+   * registry de-duplicates by path, so the existing workspace is adopted and
+   * `created` reports which case happened.
+   * @param {object} request
+   * @returns {Promise<object>}
+   */
+  async #workspaceRegister(request) {
+    const args = jsonSafe({ path: request.path, title: request.title ?? null });
+    if (typeof args.path !== 'string' || args.path.length === 0) {
+      throw new Fault(CODES.invalidRequest, { field: 'path' });
+    }
+    if (args.title !== null && (typeof args.title !== 'string' || args.title.length === 0)) {
+      throw new Fault(CODES.invalidRequest, { field: 'title' });
+    }
+
+    const info = await stat(args.path).catch(() => null);
+    if (info === null || !info.isDirectory()) {
+      throw new Fault(CODES.workspaceUnavailable, { path: args.path, reason: 'not-a-directory' });
+    }
+    const canonical = await this.host.canonicalize(args.path);
+    const before = this.host.listWorkspaces().find((workspace) => samePath(workspace.path, canonical)) ?? null;
+    const entity = await this.host.createWorkspace(canonical, args.title ?? undefined);
+
+    const committed = await this.store.mutate(
+      {
+        action: 'workspace-register',
+        operationId: request.operationId,
+        expectedRevision: request.expectedRevision,
+        args: canonicalArgs(request),
+      },
+      (draft) => {
+        const existing = draft.workspaces[entity.workspaceId] ?? null;
+        const target = existing ?? {
+          workspaceId: entity.workspaceId,
+          lastKnownPath: entity.path,
+          title: entity.title,
+          autoRestore: true,
+          requestedState: 'sleeping',
+          bindings: [],
+        };
+        // Adopt whatever the native registry says now; it is the source of truth
+        // for the path, and a re-register must not discard existing bindings.
+        target.lastKnownPath = entity.path;
+        target.title = entity.title || target.title;
+        target.updatedAt = nowIso();
+        draft.workspaces[entity.workspaceId] = target;
+        return {
+          workspaceId: entity.workspaceId,
+          path: entity.path,
+          title: entity.title,
+          created: before === null,
+          hadRecord: existing !== null,
+        };
+      },
+    );
+    return committed.value;
   }
 
   /**

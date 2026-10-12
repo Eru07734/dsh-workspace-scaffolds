@@ -112,6 +112,33 @@ async function loadPanel(stateSlots) {
 }
 
 /**
+ * Build the `useState` slot array the panel reads, by name.
+ *
+ * The panel reads its state by hook order, so a bare array silently changes
+ * meaning the moment a hook is added, and every call site has to be re-audited.
+ * Naming the slots keeps the tests readable and makes adding a hook a one-line
+ * change here.
+ * @param {object} [values]
+ * @returns {any[]}
+ */
+function slots(values = {}) {
+  const {
+    state = null,
+    error = null,
+    notice = null,
+    busy = false,
+    selected = '',
+    packageKey = '',
+    importPath = '',
+    preview = null,
+    values: templateValues = {},
+    progress = null,
+    registerPath = '',
+  } = values;
+  return [state, error, notice, busy, selected, packageKey, importPath, preview, templateValues, progress, registerPath];
+}
+
+/**
  * Mount the panel and return its resolved element tree.
  * @param {any[]} stateSlots
  */
@@ -201,7 +228,7 @@ test('the panel renders a populated snapshot without throwing', async () => {
   try {
     // useState order in the panel: state, error, notice, busy, selected, package,
     // importPath, preview, values.
-    const tree = await renderPanel([snapshot, null, null, false, '', '', '', null, {}]);
+    const tree = await renderPanel(slots({ state: snapshot }));
     const rendered = texts(tree).join(' | ');
     assert.match(rendered, /dsh-scaffold-notes/, 'the bound package must appear');
     assert.match(rendered, /demo-project/, 'the workspace must appear');
@@ -209,34 +236,27 @@ test('the panel renders a populated snapshot without throwing', async () => {
     assert.match(rendered, /actionSleep/, 'the shelf action must be offered');
     assert.match(rendered, /actionUnbind/, 'the unbind action must be offered');
     assert.match(rendered, /importRun/, 'the import form must be present');
+    assert.match(rendered, /registerRun/, 'the register form must be present');
   } finally {
     await fake.cleanup();
   }
 });
 
 test('the panel renders the loading branch before the snapshot arrives', async () => {
-  const tree = await renderPanel([null, null, null, false, '', '', '', null, {}]);
+  const tree = await renderPanel(slots());
   assert.match(texts(tree).join(' | '), /loading/);
 });
 
 test('the panel shows which build is running and warns when a restart is pending', async () => {
   const { fake, snapshot } = await realSnapshot();
   try {
-    const current = await renderPanel([snapshot, null, null, false, '', '', '', null, {}]);
+    const current = await renderPanel(slots({ state: snapshot }));
     const rendered = texts(current).join(' | ');
     assert.match(rendered, new RegExp(`version ${snapshot.pluginVersion.replace(/\./g, '\\.')}`));
 
-    const stale = await renderPanel([
-      { ...snapshot, profileSpec: 'file:/elsewhere/dsh-workspace-scaffolds-9.9.9.tgz', restartPending: true },
-      null,
-      null,
-      false,
-      '',
-      '',
-      '',
-      null,
-      {},
-    ]);
+    const stale = await renderPanel(
+      slots({ state: { ...snapshot, profileSpec: 'file:/elsewhere/dsh-workspace-scaffolds-9.9.9.tgz', restartPending: true } }),
+    );
     const staleText = texts(stale).join(' | ');
     assert.match(staleText, /restartPending/, 'a pending restart must be surfaced');
     assert.match(staleText, /9\.9\.9/, 'the declared spec must be shown');
@@ -248,7 +268,9 @@ test('the panel shows which build is running and warns when a restart is pending
 test('the panel surfaces a failure code and the busy state disables actions', async () => {
   const { fake, snapshot } = await realSnapshot();
   try {
-    const errored = await renderPanel([snapshot, { code: 'version-conflict', details: { packageName: 'x' } }, null, false, '', '', '', null, {}]);
+    const errored = await renderPanel(
+      slots({ state: snapshot, error: { code: 'version-conflict', details: { packageName: 'x' } } }),
+    );
     assert.match(texts(errored).join(' | '), /version-conflict/);
   } finally {
     await fake.cleanup();
@@ -263,7 +285,7 @@ test('the panel warns when the native plugin manager is unavailable', async () =
       capabilities: { pluginManager: false, workspaceRegistry: true },
       automaticRestore: 'degraded',
     };
-    const rendered = texts(await renderPanel([degraded, null, null, false, '', '', '', null, {}])).join(' | ');
+    const rendered = texts(await renderPanel(slots({ state: degraded }))).join(' | ');
     assert.match(rendered, /capabilityMissing/);
     assert.match(rendered, /degraded/);
   } finally {
@@ -329,7 +351,7 @@ test('the panel shows the steps of a running operation, not just a spinner', asy
       ],
       recent: [],
     };
-    const tree = await renderPanel([snapshot, null, null, true, '', '', '', null, {}, progress]);
+    const tree = await renderPanel(slots({ state: snapshot, busy: true, progress }));
     const rendered = texts(tree).join(' | ');
     assert.match(rendered, /status_running/, 'the running state must be labelled');
     assert.match(rendered, /import/, 'the action must be named');
@@ -362,7 +384,7 @@ test('the panel falls back to the last finished operation when nothing is runnin
         },
       ],
     };
-    const rendered = texts(await renderPanel([snapshot, null, null, false, '', '', '', null, {}, progress])).join(' | ');
+    const rendered = texts(await renderPanel(slots({ state: snapshot, progress }))).join(' | ');
     assert.match(rendered, /status_succeeded/);
     assert.match(rendered, /enable dsh-scaffold-notes/);
   } finally {
@@ -393,7 +415,7 @@ test('a failed step is rendered as failed with its error code', async () => {
         },
       ],
     };
-    const rendered = texts(await renderPanel([snapshot, null, null, false, '', '', '', null, {}, progress])).join(' | ');
+    const rendered = texts(await renderPanel(slots({ state: snapshot, progress }))).join(' | ');
     assert.match(rendered, /status_failed/);
     assert.match(rendered, /package-content-conflict/, 'the failure code must replace the phase');
     assert.match(rendered, /hash and archive/);

@@ -598,6 +598,94 @@ test('an unknown provenance is reported, never pinned and never released', async
   }
 });
 
+test('workspace-register brings a project under management without a raw RPC call', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const projectDir = join(fake.workspace.root, 'brand-new');
+    await mkdir(projectDir, { recursive: true });
+
+    const registered = await write(operations, { action: 'workspace-register', path: projectDir, title: 'Brand new' });
+    assert.equal(registered.created, true);
+    assert.equal(registered.hadRecord, false);
+    assert.equal(registered.title, 'Brand new');
+
+    // It must appear as a managed workspace immediately, with nothing bound and
+    // nothing enabled, so the next step can be `bind`.
+    const listed = await operations.execute({ action: 'list' });
+    const workspace = listed.workspaces.find((row) => row.workspaceId === registered.workspaceId);
+    assert.ok(workspace !== undefined, 'the registered project must be managed');
+    assert.deepEqual(workspace.bindings, []);
+    assert.equal(workspace.requestedState, 'sleeping');
+    assert.equal(workspace.registered, true);
+    assert.equal(workspace.ready, false);
+    assert.equal(listed.unmanagedWorkspaces.some((row) => row.workspaceId === registered.workspaceId), false);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('registering an already registered directory adopts it and keeps its bindings', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const projectDir = join(fake.workspace.root, 'again');
+    await mkdir(projectDir, { recursive: true });
+    const first = await write(operations, { action: 'workspace-register', path: projectDir });
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: first.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+
+    const again = await write(operations, { action: 'workspace-register', path: projectDir });
+    assert.equal(again.created, false, 'the native registry de-duplicates by path');
+    assert.equal(again.hadRecord, true);
+    assert.equal(again.workspaceId, first.workspaceId, 'the same workspace must be adopted, not duplicated');
+
+    const listed = await operations.execute({ action: 'list' });
+    const workspace = listed.workspaces.find((row) => row.workspaceId === first.workspaceId);
+    assert.equal(workspace.bindings.length, 1, 're-registering must not discard bindings');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('workspace-register refuses a path that is not a directory', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const missing = join(fake.workspace.root, 'nope');
+    await assert.rejects(
+      () => write(operations, { action: 'workspace-register', path: missing }),
+      (error) => error.code === CODES.workspaceUnavailable && error.details.reason === 'not-a-directory',
+    );
+
+    const file = join(fake.workspace.root, 'a-file.txt');
+    await writeFile(file, 'not a directory\n');
+    await assert.rejects(
+      () => write(operations, { action: 'workspace-register', path: file }),
+      (error) => error.code === CODES.workspaceUnavailable,
+    );
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('workspace-register requires a revision like every other write', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const projectDir = join(fake.workspace.root, 'guarded');
+    await mkdir(projectDir, { recursive: true });
+    await assert.rejects(
+      () => operations.execute({ action: 'workspace-register', path: projectDir, operationId: newId() }),
+      (error) => error.code === CODES.invalidRequest && error.details.field === 'expectedRevision',
+    );
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('a stale revision is refused even when the action would have been a no-op', async () => {
   const { fake, operations } = await setup();
   try {

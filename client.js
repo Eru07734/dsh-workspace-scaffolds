@@ -35,7 +35,10 @@ window.__ModuleLoader__.load({
       sectionWorkspaces: '工程',
       sectionBindings: '已关联脚手架',
       sectionPackages: '本地仓库与已装插件',
-      sectionImport: '导入脚手架包',
+      sectionRegister: '注册工程',
+      registerHint: '把一个已存在的目录注册为工程，纳入本插件管理。注册本身不会启用任何脚手架，也不会写入文件。',
+      registerPath: '工程目录',
+      registerRun: '注册',      sectionImport: '导入脚手架包',
       sectionResult: '最近一次操作',
       noWorkspaces: '还没有关联记录。先在下方导入或选择脚手架包，再添加到工程。',
       selectWorkspace: '选择工程',
@@ -127,7 +130,10 @@ window.__ModuleLoader__.load({
       sectionWorkspaces: 'Workspaces',
       sectionBindings: 'Associated scaffolds',
       sectionPackages: 'Local warehouse and installed bundles',
-      sectionImport: 'Import a scaffold package',
+      sectionRegister: 'Register a project',
+      registerHint: 'Register an existing directory as a workspace under this plugin. Registering enables no scaffold and writes no files.',
+      registerPath: 'Project directory',
+      registerRun: 'Register',      sectionImport: 'Import a scaffold package',
       sectionResult: 'Last operation',
       noWorkspaces: 'No associations yet. Import or pick a scaffold package below, then add it to a workspace.',
       selectWorkspace: 'Workspace',
@@ -273,6 +279,7 @@ window.__ModuleLoader__.load({
       const [preview, setPreview] = React.useState(null);
       const [values, setValues] = React.useState({});
       const [progress, setProgress] = React.useState(null);
+      const [registerPath, setRegisterPath] = React.useState('');
 
       const refresh = React.useCallback(async () => {
         try {
@@ -342,7 +349,7 @@ window.__ModuleLoader__.load({
         [state, refresh],
       );
 
-      return { state, error, notice, busy, selected, setSelected, packageKey, setPackageKey, importPath, setImportPath, preview, setPreview, values, setValues, progress, refresh, run, t };
+      return { state, error, notice, busy, selected, setSelected, packageKey, setPackageKey, importPath, setImportPath, preview, setPreview, values, setValues, progress, registerPath, setRegisterPath, refresh, run, t };
     }
 
     /** The glyph for one step state, paired with a label for screen readers. */
@@ -442,6 +449,7 @@ window.__ModuleLoader__.load({
         state.runningAgents ? h('p', { className: 'wsc-hint' }, t('runningAgents')) : null,
         state.pendingSleeps?.length ? h('p', { className: 'wsc-hint' }, `${t('pendingSleeps')}: ${state.pendingSleeps.join(', ')}`) : null,
 
+        RegisterSection(panel, t),
         ImportSection(panel, t),
 
         h('section', null,
@@ -472,6 +480,34 @@ window.__ModuleLoader__.load({
         BindingsSection(panel, current, packages, selectedKey, t),
         PackagesSection(panel, packages, t),
         ResultSection(error, notice, t),
+      );
+    }
+
+    /** @param {object} panel @param {object} t */
+    function RegisterSection(panel, t) {
+      return h('section', null,
+        h('h3', null, t('sectionRegister')),
+        h('p', { className: 'wsc-hint' }, t('registerHint')),
+        h('div', { className: 'wsc-field' },
+          h('label', { htmlFor: 'wsc-register' }, t('registerPath')),
+          h('input', {
+            id: 'wsc-register',
+            name: 'wsc-register',
+            type: 'text',
+            value: panel.registerPath,
+            autoComplete: 'off',
+            spellCheck: false,
+            disabled: panel.busy,
+            onChange: (event) => panel.setRegisterPath(event.target.value),
+          }),
+        ),
+        h('div', { className: 'wsc-row' },
+          h('button', {
+            type: 'button',
+            disabled: panel.busy || panel.registerPath.trim().length === 0,
+            onClick: () => void panel.run({ action: 'workspace-register', path: panel.registerPath.trim() }),
+          }, t('registerRun')),
+        ),
       );
     }
 

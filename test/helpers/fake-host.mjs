@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { createHost } from '../../src/host.js';
 import { extractTarball, inspectTarball } from '../../src/tar.js';
-import { canonicalize, resolveInside } from '../../src/util.js';
+import { canonicalize, resolveInside, samePath } from '../../src/util.js';
 
 /**
  * Read `package.json` out of an in-memory tarball.
@@ -120,6 +120,16 @@ export async function createFakeHost(options = {}) {
     },
     async create(path, title) {
       const canonical = await canonicalize(path);
+      // The real registry de-duplicates by path: registering the same directory
+      // twice returns the existing workspace. A fake that always created a new
+      // one would let a "register is idempotent" test pass while the real thing
+      // behaved differently.
+      for (const workspace of workspaces.values()) {
+        if (samePath(workspace.path, canonical)) {
+          if (title !== undefined) workspace.title = title;
+          return { id: workspace.workspaceId, path: workspace.path, title: workspace.title, sessionIds: [] };
+        }
+      }
       const workspaceId = `ws-${workspaces.size + 1}`;
       workspaces.set(workspaceId, { workspaceId, path: canonical, title: title ?? 'workspace' });
       return { id: workspaceId, path: canonical, title: title ?? 'workspace', sessionIds: [] };
