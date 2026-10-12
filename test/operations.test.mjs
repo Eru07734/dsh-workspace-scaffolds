@@ -896,6 +896,79 @@ async function waitForEvent(predicate, timeoutMs) {
   }
 }
 
+test('an optional scaffold that is off does not block readiness', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'optional-only'), 'optional');
+    const directory = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: directory });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+      required: false,
+    });
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+    // Disable the bundle behind the plugin's back: an optional association whose
+    // bundle is off is a nice-to-have that is missing, not a broken workspace.
+    fake.bundles.get('dsh-scaffold-notes').enabled = false;
+    const listed = await operations.execute({ action: 'list' });
+    const record = listed.workspaces.find((row) => row.workspaceId === workspace.workspaceId);
+    assert.equal(record.ready, true, 'an optional association must not block readiness');
+    assert.deepEqual(
+      record.blockers.map((blocker) => blocker.code),
+      ['not-enabled'],
+      'the blocker is still reported, so the panel can explain it',
+    );
+    assert.equal(record.blockers[0].required, false);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('a missing package blocks readiness only for a required association', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const requiredProject = await fake.workspace.add(join(fake.workspace.root, 'needs-it'), 'needs-it');
+    const optionalProject = await fake.workspace.add(join(fake.workspace.root, 'likes-it'), 'likes-it');
+    const directory = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: directory });
+    for (const [workspaceId, required] of [
+      [requiredProject.workspaceId, true],
+      [optionalProject.workspaceId, false],
+    ]) {
+      await write(operations, {
+        action: 'bind',
+        workspaceId,
+        packageName: imported.packageName,
+        version: imported.version,
+        required,
+      });
+      await write(operations, { action: 'wake', workspaceId });
+    }
+    // The package disappears from the native registry entirely: absent, not
+    // merely switched off.
+    fake.bundles.delete('dsh-scaffold-notes');
+
+    const listed = await operations.execute({ action: 'list' });
+    const requiredRow = listed.workspaces.find((row) => row.workspaceId === requiredProject.workspaceId);
+    const optionalRow = listed.workspaces.find((row) => row.workspaceId === optionalProject.workspaceId);
+    assert.equal(requiredRow.blockers[0].code, CODES.dependencyMissing);
+    assert.equal(requiredRow.blockers[0].required, true);
+    assert.equal(requiredRow.ready, false, 'a required scaffold that is missing must block readiness');
+    assert.equal(optionalRow.blockers[0].code, CODES.dependencyMissing);
+    assert.equal(optionalRow.blockers[0].required, false);
+    assert.equal(
+      optionalRow.ready,
+      true,
+      'an optional scaffold that is missing must not block readiness - it must not be stricter than one that is merely off',
+    );
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('a stale revision is refused even when the action would have been a no-op', async () => {
   const { fake, operations } = await setup();
   try {
@@ -1103,5 +1176,412 @@ async function fileExists(filePath) {
     return false;
   }
 }
+
+/** One workspace row from `list`, by id. @param {Operations} operations @param {string} workspaceId */
+async function workspaceRecord(operations, workspaceId) {
+  const snapshot = await operations.execute({ action: 'list' });
+  return snapshot.workspaces.find((row) => row.workspaceId === workspaceId);
+}
+
+/** One package row from `list`, by key. @param {Operations} operations @param {string} key */
+async function packageRecord(operations, key) {
+  const snapshot = await operations.execute({ action: 'list' });
+  return snapshot.packages.find((row) => row.key === key);
+}
+
+/**
+ * The fields an `update-binding` caller can name, so a "nothing else changed"
+ * assertion reads as one comparison.
+ * @param {Operations} operations
+ * @param {string} workspaceId
+ * @param {string} bindingId
+ */
+async function bindingFields(operations, workspaceId, bindingId) {
+  const workspace = await workspaceRecord(operations, workspaceId);
+  const binding = workspace.bindings.find((row) => row.id === bindingId);
+  return {
+    enabled: binding.enabled,
+    required: binding.required,
+    templateId: binding.templateId,
+    templateValues: binding.templateValues,
+    autoRestore: workspace.autoRestore,
+  };
+}
+
+/**
+ * Establish a binding's starting values by writing state directly, so a partial
+ * update can be measured against a known, distinctive baseline rather than
+ * against whatever `bind` happens to default to.
+ * @param {Operations} operations
+ * @param {string} workspaceId
+ * @param {string} bindingId
+ * @param {{binding?: object, workspace?: object}} patch
+ */
+async function seedBinding(operations, workspaceId, bindingId, patch) {
+  await operations.store.mutate(
+    { action: 'update-binding', operationId: newId(), expectedRevision: operations.store.revision },
+    (draft) => {
+      const workspace = draft.workspaces[workspaceId];
+      const binding = workspace.bindings.find((row) => row.id === bindingId);
+      Object.assign(binding, patch.binding ?? {});
+      Object.assign(workspace, patch.workspace ?? {});
+      return {};
+    },
+  );
+  return await bindingFields(operations, workspaceId, bindingId);
+}
+
+test('F06: re-importing a managed package does not rewrite it into external + pinned', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'reimport'), 'reimport');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+
+    // What a wake leaves behind: this plugin's own enablement, recorded as such.
+    let record = await packageRecord(operations, imported.packageKey);
+    assert.equal(record.ownership, 'managed');
+    assert.equal(record.pinned, false);
+    assert.equal(record.lastAppliedEnabled, true);
+    assert.equal(record.initiallyEnabled, false);
+
+    // Importing the very same directory again must not read the native
+    // "enabled" it observes as somebody else's intent.
+    const again = await write(operations, { action: 'import', path: packageDir });
+    assert.equal(again.archiveSha256, imported.archiveSha256, 'the same snapshot bytes are re-imported');
+
+    record = await packageRecord(operations, imported.packageKey);
+    assert.equal(record.ownership, 'managed', 'a re-import must not hand ownership to an outside party');
+    assert.equal(record.pinned, false, 'a re-import must not pin what this plugin itself enabled');
+    assert.equal(record.lastAppliedEnabled, true, 'the provenance of the current enablement must survive');
+    assert.equal(record.initiallyEnabled, false, 'a first-sighting fact must not be rewritten later');
+    assert.equal(record.archiveSha256, imported.archiveSha256, 'the archive metadata is still refreshed');
+
+    // The consequence that matters: the shelf can still release it.
+    const slept = await write(operations, { action: 'sleep', workspaceId: workspace.workspaceId });
+    assert.deepEqual(slept.release.released, [{ key: imported.packageKey, outcome: 'applied' }]);
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, false);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F06: an explicit pin survives a repeat import', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    // The user asked for this bundle to stay on outside any workspace's need.
+    await write(operations, { action: 'set-pin', packageKey: imported.packageKey, pinned: true });
+    assert.equal((await packageRecord(operations, imported.packageKey)).pinned, true);
+
+    await write(operations, { action: 'import', path: packageDir });
+
+    const record = await packageRecord(operations, imported.packageKey);
+    assert.equal(record.pinned, true, 'a pin the user set must not be cleared by a re-import');
+    assert.equal(record.ownership, 'managed', 'and the owning side must not be rewritten either');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F06: the first import still infers external + pinned from an already-enabled bundle', async () => {
+  const { fake, operations } = await setup(async (host) => {
+    await host.preinstall('dsh-scaffold-notes', '0.1.0', true);
+  });
+  try {
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    assert.equal(imported.nativeEnabled, true);
+
+    // Nothing was recorded before this import, so the native state is the only
+    // evidence available and it must still be read as outside intent.
+    const record = await packageRecord(operations, imported.packageKey);
+    assert.equal(record.ownership, 'external');
+    assert.equal(record.pinned, true);
+    assert.equal(record.lastAppliedEnabled, true);
+    assert.equal(record.initiallyEnabled, true);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F07: a partial update touches only the field it names', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'partial'), 'partial');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    const bound = await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    const seed = { binding: { templateId: 'custom', templateValues: { projectName: 'seeded' } }, workspace: { autoRestore: false } };
+    assert.deepEqual(await seedBinding(operations, workspace.workspaceId, bound.bindingId, seed), {
+      enabled: true,
+      required: true,
+      templateId: 'custom',
+      templateValues: { projectName: 'seeded' },
+      autoRestore: false,
+    });
+
+    await write(operations, {
+      action: 'update-binding',
+      workspaceId: workspace.workspaceId,
+      bindingId: bound.bindingId,
+      enabled: false,
+    });
+
+    assert.deepEqual(await bindingFields(operations, workspace.workspaceId, bound.bindingId), {
+      enabled: false,
+      required: true,
+      templateId: 'custom',
+      templateValues: { projectName: 'seeded' },
+      autoRestore: false,
+    });
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F07: naming only templateValues leaves every boolean alone', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'values-only'), 'values-only');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    const bound = await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    await seedBinding(operations, workspace.workspaceId, bound.bindingId, {
+      binding: { templateId: 'custom', templateValues: { projectName: 'seeded' } },
+      workspace: { autoRestore: false },
+    });
+
+    await write(operations, {
+      action: 'update-binding',
+      workspaceId: workspace.workspaceId,
+      bindingId: bound.bindingId,
+      templateValues: { projectName: 'second' },
+    });
+
+    assert.deepEqual(await bindingFields(operations, workspace.workspaceId, bound.bindingId), {
+      enabled: true,
+      required: true,
+      templateId: 'custom',
+      templateValues: { projectName: 'second' },
+      autoRestore: false,
+    });
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F07: each updatable field can be submitted on its own', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'one-at-a-time'), 'one-at-a-time');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    const bound = await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    const baseline = {
+      enabled: true,
+      required: true,
+      templateId: 'custom',
+      templateValues: { projectName: 'seeded' },
+      autoRestore: false,
+    };
+    const cases = [
+      { request: { required: false }, expected: { ...baseline, required: false } },
+      { request: { enabled: false }, expected: { ...baseline, enabled: false } },
+      { request: { autoRestore: true }, expected: { ...baseline, autoRestore: true } },
+      { request: { templateId: null }, expected: { ...baseline, templateId: null } },
+      { request: { templateId: 'replaced' }, expected: { ...baseline, templateId: 'replaced' } },
+      { request: { templateValues: { projectName: 'third' } }, expected: { ...baseline, templateValues: { projectName: 'third' } } },
+    ];
+    for (const [index, step] of cases.entries()) {
+      // Every case starts from the same baseline, by writing it directly rather
+      // than through the action under test.
+      assert.deepEqual(
+        await seedBinding(operations, workspace.workspaceId, bound.bindingId, {
+          binding: { enabled: true, required: true, templateId: 'custom', templateValues: { projectName: 'seeded' } },
+          workspace: { autoRestore: false },
+        }),
+        baseline,
+      );
+      await write(operations, {
+        action: 'update-binding',
+        workspaceId: workspace.workspaceId,
+        bindingId: bound.bindingId,
+        ...step.request,
+      });
+      assert.deepEqual(
+        await bindingFields(operations, workspace.workspaceId, bound.bindingId),
+        step.expected,
+        `case ${index}: ${JSON.stringify(step.request)}`,
+      );
+    }
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F07: invalid types are refused and explicit null means only what it says', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'types'), 'types');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    const bound = await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    const reject = async (extra, field) => {
+      await assert.rejects(
+        () =>
+          write(operations, {
+            action: 'update-binding',
+            workspaceId: workspace.workspaceId,
+            bindingId: bound.bindingId,
+            ...extra,
+          }),
+        (error) => error.code === CODES.invalidRequest && error.details.field === field,
+        `expected ${JSON.stringify(extra)} to be refused for ${field}`,
+      );
+    };
+
+    await reject({ enabled: 'yes' }, 'enabled');
+    // A boolean field must refuse an explicit null rather than read it as
+    // "clear" or as an omission.
+    await reject({ required: null }, 'required');
+    await reject({ autoRestore: null }, 'autoRestore');
+    await reject({ templateId: 7 }, 'templateId');
+    await reject({ templateValues: null }, 'templateValues');
+    await reject({ templateValues: 'nope' }, 'templateValues');
+
+    // The one nullable field. `null` clears the selection - which in the stored
+    // shape means "no explicit template, use the descriptor's default" - and
+    // still leaves every other field untouched.
+    await write(operations, {
+      action: 'update-binding',
+      workspaceId: workspace.workspaceId,
+      bindingId: bound.bindingId,
+      templateId: 'notes',
+    });
+    assert.equal((await bindingFields(operations, workspace.workspaceId, bound.bindingId)).templateId, 'notes');
+
+    await write(operations, {
+      action: 'update-binding',
+      workspaceId: workspace.workspaceId,
+      bindingId: bound.bindingId,
+      templateId: null,
+    });
+    assert.deepEqual(await bindingFields(operations, workspace.workspaceId, bound.bindingId), {
+      enabled: true,
+      required: true,
+      templateId: null,
+      templateValues: {},
+      autoRestore: true,
+    });
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F14: ready and blockers come from the same rule', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'readiness'), 'readiness');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    const bound = await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+
+    let record = await workspaceRecord(operations, workspace.workspaceId);
+    assert.equal(record.requestedState, 'awake');
+    assert.equal(record.ready, true, 'a required bundle that is on is ready');
+    assert.deepEqual(record.blockers, []);
+
+    // The required bundle is switched off out of band: the association still
+    // asks for it, so the workspace is not ready whatever the intent says.
+    fake.bundles.get('dsh-scaffold-notes').enabled = false;
+    record = await workspaceRecord(operations, workspace.workspaceId);
+    assert.deepEqual(record.blockers.map((blocker) => blocker.code), ['not-enabled']);
+    assert.equal(record.blockers[0].required, true);
+    assert.equal(record.ready, false, 'a required association whose bundle is off must not report ready');
+
+    fake.bundles.get('dsh-scaffold-notes').enabled = true;
+    record = await workspaceRecord(operations, workspace.workspaceId);
+    assert.equal(record.ready, true, 're-enabling the required bundle restores readiness');
+
+    // The distinction that must survive: the user opting out of an association
+    // is not the same thing as that association's bundle being off.
+    await write(operations, {
+      action: 'update-binding',
+      workspaceId: workspace.workspaceId,
+      bindingId: bound.bindingId,
+      enabled: false,
+    });
+    fake.bundles.get('dsh-scaffold-notes').enabled = false;
+    record = await workspaceRecord(operations, workspace.workspaceId);
+    assert.deepEqual(record.blockers, [], 'an opted-out association claims nothing');
+    assert.equal(record.ready, true, 'an opt-out is the user\u2019s choice, not a missing prerequisite');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F14: an optional association does not block readiness when its bundle is off', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'optional'), 'optional');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+      required: false,
+    });
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+    assert.equal((await workspaceRecord(operations, workspace.workspaceId)).ready, true);
+
+    fake.bundles.get('dsh-scaffold-notes').enabled = false;
+    const record = await workspaceRecord(operations, workspace.workspaceId);
+    assert.deepEqual(record.blockers.map((blocker) => blocker.code), ['not-enabled']);
+    assert.equal(record.blockers[0].required, false);
+    assert.equal(record.ready, true, 'an optional association that is off is reported, not blocking');
+  } finally {
+    await fake.cleanup();
+  }
+});
 
 export { rm };

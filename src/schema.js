@@ -38,6 +38,34 @@ function refuse(reason, detail) {
 }
 
 /**
+ * Validate and copy a `requires` list - the dependency edges of one scaffold
+ * descriptor.
+ *
+ * Deliberately one definition shared by the two places an edge can enter the
+ * plugin: `scaffold.js` when a descriptor is read, and `normalizePackage` when
+ * the summary is loaded back from disk. The
+ * coordinator trusts `record.scaffold.requires`, so a malformed entry must be
+ * refused rather than repaired here: silently dropping it would switch off
+ * exactly the dependency ordering and cycle detection this field feeds.
+ *
+ * An absent field is an empty list - "declares no dependencies". That is also
+ * what a package record written before this field existed normalizes to; see
+ * the note in {@link normalizePackage}.
+ * @param {any} value
+ * @returns {Array<{name: string, version: string}>}
+ */
+export function readRequires(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Fault(CODES.scaffoldInvalid, { reason: 'requires-not-array' });
+  return value.map((entry) => {
+    if (!isPlainObject(entry) || !isNonEmptyString(entry.name) || !isNonEmptyString(entry.version)) {
+      throw new Fault(CODES.scaffoldInvalid, { reason: 'bad-requirement', entry });
+    }
+    return { name: entry.name, version: entry.version };
+  });
+}
+
+/**
  * Validate and normalize the parts of a package record that come from disk.
  * @param {any} raw
  * @param {string} key
@@ -77,6 +105,20 @@ function normalizePackage(raw, key) {
             ? raw.scaffold.templateIds.filter(isNonEmptyString)
             : [],
           variables: isPlainObject(raw.scaffold.variables) ? raw.scaffold.variables : {},
+          // Carried through the state round-trip, never re-derived: the
+          // coordinator reads dependency edges from this field, so a
+          // normalizer that dropped it silently disabled dependency ordering,
+          // missing-dependency refusal and cycle detection on the real path.
+          //
+          // A record written before `requires` existed has no such key and
+          // normalizes to `[]` - the dependency rules simply do not apply to
+          // it. The alternative, re-reading the descriptor out of the stored
+          // archive, is I/O that this pure normalizer cannot perform (and it
+          // would be a hidden fetch on every state load). `[]` is also the
+          // honest reading of the old document: it declares no edges. Nothing
+          // is lost permanently, because re-importing the same package
+          // rewrites the record from its descriptor and restores the edges.
+          requires: readRequires(raw.scaffold.requires),
         }
       : null,
   };

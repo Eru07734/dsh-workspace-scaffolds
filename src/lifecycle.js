@@ -36,6 +36,17 @@ export class Activity {
       if (id === '') return;
       this.statuses.set(id, this.host.agentStatus(agent));
     };
+    // Hot load: `apply()` can run while agents are already mid-turn, and the
+    // events for them happened before this subscription existed. The status
+    // handler below is the only place that can recognise the transition out of
+    // work, and it recognises it by comparing the incoming status against its
+    // own cache - but DSH updates the agent's status *before* it emits
+    // `agent/status`, so the cache is the only witness of the previous state.
+    // Seeding it from the live registry (the same `listAgents()` source
+    // `busy()` already consults) means the first status event after a hot load
+    // is compared against the running state that was already in flight;
+    // without it the sleep queued behind that agent would never be drained.
+    for (const agent of this.host.listAgents()) remember(agent);
     this.disposers.push(
       ctx.on('agent/created', ({ agent }) => {
         remember(agent);
@@ -46,18 +57,16 @@ export class Activity {
         if (agent === undefined || agent === null) return;
         const id = String(agent.id ?? '');
         if (id === '') return;
-        const before = this.busy();
         this.statuses.set(id, status === 'running' ? 'running' : 'idle');
-        if (before && !this.busy()) this.#notifyIdle();
+        this.#settleIdle();
       }),
     );
     this.disposers.push(
       ctx.on('agent/disposed', ({ agent }) => {
         if (agent === undefined || agent === null) return;
         const id = String(agent.id ?? '');
-        const before = this.busy();
         this.statuses.delete(id);
-        if (before && !this.busy()) this.#notifyIdle();
+        this.#settleIdle();
       }),
     );
   }
@@ -110,6 +119,25 @@ export class Activity {
         // One broken listener must not starve the others.
       }
     }
+  }
+
+  /**
+   * Announce an idle boundary when no agent is running any more.
+   *
+   * The test is deliberately "is anything running *now*?" rather than "did the
+   * agent I was tracking just stop?". A transition is only observable as a
+   * difference against `this.statuses`, and any gap between the seed above and
+   * the live events - a hot load whose seed raced a status event, or a
+   * `running` event that never reached this plugin - leaves the cache without
+   * the running entry, so a "was busy" comparison would be false and the
+   * boundary would be swallowed. Notifying whenever the environment is idle
+   * after the update cannot miss that boundary, and it is safe to over-notify:
+   * `SleepQueue.drain()` joins an in-flight drain instead of starting a second
+   * one and returns immediately when nothing is queued.
+   * @returns {void}
+   */
+  #settleIdle() {
+    if (!this.busy()) this.#notifyIdle();
   }
 }
 

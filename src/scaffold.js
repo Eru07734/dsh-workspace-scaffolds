@@ -6,7 +6,7 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Fault, CODES } from './errors.js';
-import { isNonEmptyString, isPlainObject } from './schema.js';
+import { isNonEmptyString, isPlainObject, readRequires } from './schema.js';
 import { resolveInside } from './util.js';
 
 /** Variable names allowed inside `{{...}}` placeholders. */
@@ -77,16 +77,7 @@ export function validateDescriptor(raw, context) {
       };
     }
   }
-  const requires = [];
-  if (raw.requires !== undefined) {
-    if (!Array.isArray(raw.requires)) throw new Fault(CODES.scaffoldInvalid, { reason: 'requires-not-array' });
-    for (const entry of raw.requires) {
-      if (!isPlainObject(entry) || !isNonEmptyString(entry.name) || !isNonEmptyString(entry.version)) {
-        throw new Fault(CODES.scaffoldInvalid, { reason: 'bad-requirement', entry });
-      }
-      requires.push({ name: entry.name, version: entry.version });
-    }
-  }
+  const requires = readRequires(raw.requires);
   const templates = [];
   if (raw.templates !== undefined) {
     if (!Array.isArray(raw.templates)) throw new Fault(CODES.scaffoldInvalid, { reason: 'templates-not-array' });
@@ -141,6 +132,13 @@ export function validateDescriptor(raw, context) {
 
 /**
  * Summarize a descriptor for the state file, without absolute paths.
+ *
+ * `requires` belongs in the summary: the coordinator reads dependency edges
+ * from the stored record, not from the descriptor, so a summary that dropped
+ * this field made dependency ordering, missing-dependency refusal and cycle
+ * detection dead code on the real import path - only hand-built records could
+ * exercise them. Re-validated through the same shared helper the descriptor
+ * reader uses, so a summary can never carry an edge the reader would refuse.
  * @param {object|null} descriptor
  * @returns {object|null}
  */
@@ -148,6 +146,7 @@ export function summarizeDescriptor(descriptor) {
   if (descriptor === null) return null;
   return {
     title: descriptor.title,
+    requires: readRequires(descriptor.requires),
     templateIds: descriptor.templates.map((template) => template.id),
     variables: Object.fromEntries(
       Object.entries(descriptor.variables).map(([name, definition]) => [

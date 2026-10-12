@@ -504,16 +504,31 @@ export class Operations {
       });
       const blockers = [];
       for (const binding of bindings) {
+        // An association the user switched off is an opt-out: it claims nothing,
+        // so it can never block readiness. Its bundle being off is expected.
         if (!binding.enabled) continue;
         if (binding.package.status === 'absent') {
-          blockers.push({ bindingId: binding.id, code: CODES.dependencyMissing, packageName: binding.packageName });
+          blockers.push({ bindingId: binding.id, code: CODES.dependencyMissing, packageName: binding.packageName, required: binding.required });
         } else if (binding.package.status === 'mismatch') {
-          blockers.push({ bindingId: binding.id, code: CODES.versionConflict, packageName: binding.packageName });
+          blockers.push({ bindingId: binding.id, code: CODES.versionConflict, packageName: binding.packageName, required: binding.required });
         } else if (!binding.package.enabled) {
           blockers.push({ bindingId: binding.id, code: 'not-enabled', packageName: binding.packageName, required: binding.required });
         }
       }
-      const requiredBlocked = blockers.some((blocker) => blocker.required !== false && blocker.code !== 'not-enabled');
+      // `ready` is derived from `blockers`, never from a second, narrower rule:
+      // a blocker that is not explicitly optional blocks. Excluding
+      // `not-enabled` here is what let a workspace report `ready: true` while a
+      // required association's bundle was actually switched off, hiding exactly
+      // the state `blockers` exists to report.
+      //
+      // Every blocker therefore carries `required`, including the ones for a
+      // package that is absent or at the wrong version. Without that, an
+      // optional association would stop blocking when its bundle was merely off
+      // but would block when the package was missing - the same inconsistency
+      // in the other direction. The blocker is still reported either way, so the
+      // panel can explain the missing optional scaffold; it just does not make
+      // the workspace unready.
+      const requiredBlocked = blockers.some((blocker) => blocker.required !== false);
       return {
         workspaceId: record.workspaceId,
         title: record.title || registered?.title || record.lastKnownPath,
@@ -807,20 +822,45 @@ export class Operations {
     const committed = await this.store.mutate(
       { action: 'import', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
       (draft) => {
-        draft.packages[key] = {
+        // `after.enabled` is only what the native manager reports right now. It
+        // is evidence about intent on the *first* sighting of a package, but
+        // never on a later one: a package this plugin enabled for an awake
+        // workspace is enabled natively too, and rewriting the record from that
+        // observation would relabel the plugin's own enablement as outside
+        // intent (`external`) and pin it, which permanently defeats shelving.
+        //
+        // So the intent-carrying fields are preserved whenever a record already
+        // exists - `ownership` and `pinned` (what the user asked for),
+        // `lastAppliedEnabled` (the provenance that lets a restart tell this
+        // plugin's own unreleased leftover from somebody else's enablement) and
+        // `initiallyEnabled` (a first-sighting fact). Only the archive-derived
+        // metadata is refreshed. `importedAt` is preserved as well: it dates the
+        // package's entry into the warehouse, and a re-import of byte-identical
+        // content (a different digest is refused above as a content conflict)
+        // does not re-date it. The import is still visible in the operation log.
+        const previous = draft.packages[key] ?? null;
+        const archive = {
           archiveSha256: imported.archiveSha256,
           sourceKind: imported.sourceKind,
           restoreCapability: 'archived',
-          initiallyEnabled: after.enabled,
-          ownership: after.enabled ? 'external' : 'managed',
-          pinned: after.enabled,
-          lastAppliedEnabled: after.enabled,
           title: imported.title,
-          importedAt: nowIso(),
           archiveEntryCount: imported.entryCount,
           archiveBytes: imported.bytes,
           scaffold: summarizeDescriptor(descriptor),
         };
+        draft.packages[key] =
+          previous === null
+            ? {
+                ...archive,
+                // First sighting: infer ownership from whether the native
+                // manager already had the bundle on before this import ran.
+                initiallyEnabled: after.enabled,
+                ownership: after.enabled ? 'external' : 'managed',
+                pinned: after.enabled,
+                lastAppliedEnabled: after.enabled,
+                importedAt: nowIso(),
+              }
+            : { ...previous, ...archive };
         return {
           packageKey: key,
           packageName: imported.name,
@@ -1008,22 +1048,48 @@ export class Operations {
    * @returns {Promise<object>}
    */
   async #updateBinding(request) {
-    const args = jsonSafe({
-      workspaceId: request.workspaceId,
-      bindingId: request.bindingId,
-      enabled: request.enabled,
-      required: request.required,
-      autoRestore: request.autoRestore,
-      templateId: request.templateId,
-      templateValues: request.templateValues,
-    });
-    if (typeof args.workspaceId !== 'string' || typeof args.bindingId !== 'string') {
-      throw new Fault(CODES.invalidRequest, { field: 'bindingId' });
+    // "Which fields did the caller provide" is decided on the raw request, not
+    // on `jsonSafe`'s output: `jsonSafe` (src/store.js) maps `undefined` to
+    // `null`, so an omitted field would otherwise be indistinguishable from an
+    // explicit `null` - which both rejected every partial update and, when all
+    // booleans happened to be supplied, silently overwrote omitted
+    // `templateId`/`templateValues` with `null`/`{}`.
+    //
+    // Explicit `null`, decided here and pinned by tests in
+    // test/operations.test.mjs:
+    // - `enabled`, `required` and `autoRestore` are booleans; an explicit `null`
+    //   is refused as an invalid type. It is never read as a "clear" and never
+    //   silently treated as an omission.
+    // - `templateId` is nullable in the stored shape (`src/schema.js` normalizes
+    //   anything that is not a string to `null`, meaning "no explicit template,
+    //   use the descriptor's default"), so an explicit `templateId: null` is
+    //   accepted and clears the selection.
+    // - `templateValues` is an object; an explicit `null` is refused, because the
+    //   empty object `{}` is the clearing form.
+    const provided = { workspaceId: request.workspaceId, bindingId: request.bindingId };
+    for (const field of ['enabled', 'required', 'autoRestore', 'templateId', 'templateValues']) {
+      if (Object.hasOwn(request, field) && request[field] !== undefined) provided[field] = request[field];
     }
     for (const field of ['enabled', 'required', 'autoRestore']) {
-      if (args[field] !== undefined && typeof args[field] !== 'boolean') {
+      if (Object.hasOwn(provided, field) && typeof provided[field] !== 'boolean') {
         throw new Fault(CODES.invalidRequest, { field });
       }
+    }
+    if (Object.hasOwn(provided, 'templateId') && provided.templateId !== null && typeof provided.templateId !== 'string') {
+      throw new Fault(CODES.invalidRequest, { field: 'templateId' });
+    }
+    if (Object.hasOwn(provided, 'templateValues')) {
+      const values = provided.templateValues;
+      if (typeof values !== 'object' || values === null || Array.isArray(values)) {
+        throw new Fault(CODES.invalidRequest, { field: 'templateValues' });
+      }
+    }
+    // `provided` is already sparse, so this preserves the presence information
+    // while still making whatever the caller did send JSON-safe before it is
+    // stored.
+    const args = jsonSafe(provided);
+    if (typeof args.workspaceId !== 'string' || typeof args.bindingId !== 'string') {
+      throw new Fault(CODES.invalidRequest, { field: 'bindingId' });
     }
     const committed = await this.store.mutate(
       { action: 'update-binding', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
@@ -1032,11 +1098,11 @@ export class Operations {
         if (target === undefined) throw new Fault(CODES.workspaceNotFound, { workspaceId: args.workspaceId });
         const binding = target.bindings.find((entry) => entry.id === args.bindingId);
         if (binding === undefined) throw new Fault(CODES.invalidRequest, { field: 'bindingId', reason: 'unknown-binding' });
-        if (args.enabled !== undefined) binding.enabled = args.enabled;
-        if (args.required !== undefined) binding.required = args.required;
-        if (args.templateId !== undefined) binding.templateId = args.templateId;
-        if (args.templateValues !== undefined) binding.templateValues = { ...args.templateValues };
-        if (args.autoRestore !== undefined) target.autoRestore = args.autoRestore;
+        if (Object.hasOwn(args, 'enabled')) binding.enabled = args.enabled;
+        if (Object.hasOwn(args, 'required')) binding.required = args.required;
+        if (Object.hasOwn(args, 'templateId')) binding.templateId = args.templateId;
+        if (Object.hasOwn(args, 'templateValues')) binding.templateValues = { ...args.templateValues };
+        if (Object.hasOwn(args, 'autoRestore')) target.autoRestore = args.autoRestore;
         target.updatedAt = nowIso();
         return { workspaceId: args.workspaceId, bindingId: args.bindingId };
       },
