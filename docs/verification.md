@@ -1,5 +1,11 @@
 # 验证记录
 
+> ## 状态：**未经验证 · UNVERIFIED**
+>
+> 本插件**从未在真实的 DSH 环境中安装或运行过**。本文件记录的是**假宿主上的自动化验证**：它能证明代码逻辑自洽、边界处理正确，**不能**证明本插件在真实 DSH 中可用。
+>
+> 本项目 v0.1.0 发布时未附此声明，v0.1.1 起补齐。请按实验性代码对待。
+
 本文件记录 `dsh-workspace-scaffolds` 的验证方式、覆盖范围与当前结论。
 
 ## 运行方式
@@ -57,12 +63,14 @@ node --test test/*.test.mjs
 node scripts/pack.mjs ..
 ```
 
-产物为 `dsh-workspace-scaffolds-0.1.0.tgz`，由本插件自己的 USTAR 写入器生成（无网络、无第三方工具）。已验证：- 解包后有 30 个条目，含 `package.json`、`plugin.js`、`index.js`、`client.js`、`cordis.patch.yml`、`README.md`、`LICENSE`、`icon.svg`、15 个 `src/` 文件、2 个 `locale/` 文件；
+产物为 `dsh-workspace-scaffolds-<version>.tgz`，由本插件自己的 USTAR 写入器生成（无网络、无第三方工具）。已验证：
+
+- 解包后有 30 个条目，含 `package.json`、`plugin.js`、`index.js`、`client.js`、`cordis.patch.yml`、`README.md`、`LICENSE`、`icon.svg`、15 个 `src/` 文件、2 个 `locale/` 文件；
 - 不含 `test/`、`node_modules/`、`state.json` 等不应发布的内容；
 - 从解包目录 `import` 得到 `name = workspace-scaffolds`、`inject = ["connection","tools"]`、`apply` 为函数；
 - 对解包产物调用 `apply` 可成功挂载 `/api/workspace-scaffolds/state`、`/api/workspace-scaffolds/execute`、工具 `workspace_scaffolds` 以及 `agent/created`、`agent/status`、`agent/disposed`、`plugin-manager/changed` 监听。
 
-当前发行包 SHA-256：
+v0.1.0 的发行包 SHA-256（保留作历史记录）：
 
 ```
 d3fa6c6d2398d7c4d69b1e62e67ffa8929874ab1fc3b75f8706bdf4a3436d034
@@ -96,8 +104,26 @@ d3fa6c6d2398d7c4d69b1e62e67ffa8929874ab1fc3b75f8706bdf4a3436d034
 以下内容需要一次真实的 DSH 会话才能确认，本文件明确记录为**未验证**：
 
 1. 真实 profile 中通过 `pnpm` 安装 `.tgz` 的端到端表现（测试用假宿主在内存中复现了同样的契约）。
-2. `agent/created` 中调用 `setBundleEnabled` 与原生 HMR 锁的实际顺序（实现已加 15 秒预算与降级上报，避免挂起）。
-3. 面板在真实浏览器中的样式与交互（已用真实载荷做渲染级验证，但未做视觉验证）。
-4. 客户端 bundle 的热更新行为：本插件是普通 bundle，改动需要重新安装并刷新页面。
+2. 真实插件管理器的启用／停用行为，以及 `restart-required` 的实际表现。
+3. `agent/created` 中调用 `setBundleEnabled` 与原生 HMR 锁的实际顺序（实现已加 15 秒预算与降级上报，避免挂起）。
+4. 面板在真实浏览器中的渲染、交互与样式（已用真实载荷做渲染级验证，但未做视觉验证）。
+5. 客户端 bundle 的更新与热加载行为：本插件是普通 bundle，改动需要重新安装并刷新页面。
+6. 与具体 DSH 版本升级后的兼容性。
 
-结论：核心闭环（关联 → 生成 → 启用 → 休眠 → 恢复）与其并发、幂等、路径安全、状态恢复语义均有自动化证据；上述四项属于部署环境验证，不是代码逻辑缺口。
+## 结论
+
+**本项目未经验证。** 现有的自动化证据只支持一个结论：核心闭环（关联 → 生成 → 启用 → 休眠 → 恢复）的**逻辑**在假宿主上是自洽的——并发冲突、幂等重放、路径穿越、归档安全、状态损坏恢复、多工程共享与休眠排队都有回归保护。它**不**支持「这个插件能在真实 DSH 里正常工作」这一结论。
+
+## 完成验证需要做什么
+
+按顺序执行，每步记录实际输出：
+
+1. 在**非关键 profile** 中 `dsh plugin add` 本发行包，确认能够加载、面板出现在插件页且不报错。
+2. 导入 `examples/dsh-scaffold-notes`，关联到一个测试工程，走完 预览 → 生成 → 恢复 → 休眠 → 再恢复。
+3. 确认休眠后 bundle 在原生插件页显示为停用，且安装仍保留；再确认恢复后工具真实可用（不是仅状态显示为启用）。
+4. 在两个工程共享同一个包的条件下重复休眠／恢复，确认不会互相误停用。
+5. 在真实浏览器中检查面板的布局、变量输入与错误提示。
+6. 重启 DSH，确认关联、版本与运行状态对账正确。
+7. 若第 3 或第 6 步失败，请连同 `plugin-manager` 的 `application` 返回值一起记录——那正是本插件依赖但尚未实测的接口行为。
+
+完成上述步骤后，请把结论写回本文件，并移除 README 顶部的未验证声明。

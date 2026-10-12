@@ -1,5 +1,22 @@
 # 工程脚手架 · dsh-workspace-scaffolds
 
+> ## ⚠️ 本项目尚未经过验证 · UNVERIFIED
+>
+> **这个插件从未在真实的 DSH 环境中安装或使用过。**
+>
+> 仓库中的测试与 CI 只能说明**代码逻辑在受控的假宿主下自洽**，**不能**说明它装进你的 DSH 之后能正常工作。请把它当作**实验性代码**：先在非关键环境试用，不要直接用在实际工程上。
+>
+> 以下关键环节**全部未经真实验证**：
+>
+> - 真实 profile 中通过 `pnpm` 安装本插件的端到端表现；
+> - 真实插件管理器的启用／停用行为，以及 `restart-required` 的实际表现；
+> - `agent/created` 中启用插件与原生 HMR 锁的真实先后顺序；
+> - 浏览器面板的真实渲染、交互与样式；
+> - 客户端 bundle 的更新与热加载行为；
+> - 与真实 DSH 版本升级后的兼容性。
+>
+> 详细说明与后续验证清单见 [docs/verification.md](docs/verification.md)。
+
 把 DSH **工程**（Workspace）与工程使用的**脚手架插件**关联起来的插件。
 
 - **开工前**：选择工程需要的脚手架，预览并生成初始文件，然后恢复插件。
@@ -43,7 +60,7 @@
 # 在 DSH 中通过插件管理器安装本目录或发行包
 dsh plugin add /absolute/path/to/dsh-workspace-scaffolds
 # 或安装打包好的发行包
-dsh plugin add ./dsh-workspace-scaffolds-0.1.0.tgz
+dsh plugin add ./dsh-workspace-scaffolds-0.1.1.tgz
 ```
 
 安装后需要为本插件启用 bundle（默认 `cordis.patch.yml` 已声明）。面板出现在 **插件页 → 本插件卡片**，使用 `plugins.bundle.config` 插槽。
@@ -172,11 +189,22 @@ POST /api/workspace-scaffolds/execute
 
 ## 验证
 
+> **先说清楚这套验证证明不了什么。** 下面全部测试都在**假宿主**上运行，从未接触真实 DSH。它们能证明代码逻辑自洽、边界处理正确；**不能**证明本插件在真实 DSH 中可用。参见顶部声明。
+
 ```bash
 node --test test/*.test.mjs
 ```
 
+| 验证了什么 | 没验证什么 |
+|---|---|
+| 71 项 `node:test` 用例全部通过 | 真实 DSH 中的安装与加载 |
+| Linux（Node 22 / 24）与 Windows 上均通过 | 真实插件管理器的启停与重启行为 |
+| 真实 `src/host.js` 适配层被实际执行（非桩替换） | 浏览器面板的真实渲染与交互 |
+| 发行包可解包、可 `import`、`apply` 可挂载路由与工具 | 与具体 DSH 版本的兼容性 |
+
 测试覆盖的验收场景与结果见 [docs/verification.md](docs/verification.md)。测试使用内存假宿主验证真实的 `src/host.js` 适配层，因此原生 `installBundle(..., {enabled:false})` 这类契约本身也在测试范围内。
+
+**试用前请自行确认**：本插件会在 `<profileDir>/workspace-scaffolds/` 下写入状态，并会调用原生插件管理器启用／停用 bundle。请先在非关键 profile 或副本工程上验证。
 
 ## 脚手架包格式
 
