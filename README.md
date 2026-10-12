@@ -1,21 +1,19 @@
 # 工程脚手架 · dsh-workspace-scaffolds
 
-> ## ⚠️ 本项目尚未经过验证 · UNVERIFIED
+> ## ⚠️ 仅部分验证 · PARTIALLY VERIFIED
 >
-> **这个插件从未在真实的 DSH 环境中安装或使用过。**
+> **请仍按实验性代码对待：核心工作流尚未在真实工程上跑通。**
 >
-> 仓库中的测试与 CI 只能说明**代码逻辑在受控的假宿主下自洽**，**不能**说明它装进你的 DSH 之后能正常工作。请把它当作**实验性代码**：先在非关键环境试用，不要直接用在实际工程上。
+> **已在真实 DSH 中验证**（profile `desktop`，v0.1.2）：安装成功并**热载入**（`application: "applied"`，无需重启）；loader 条目 `fiberPhase=active`；两个原生服务均解析成功；能读取真实工程注册表；HTTP 接口返回正确数据；参数校验与错误码正确。
 >
-> 以下关键环节**全部未经真实验证**：
+> **仍未在真实环境验证**：
 >
-> - 真实 profile 中通过 `pnpm` 安装本插件的端到端表现；
-> - 真实插件管理器的启用／停用行为，以及 `restart-required` 的实际表现；
-> - `agent/created` 中启用插件与原生 HMR 锁的真实先后顺序；
-> - 浏览器面板的真实渲染、交互与样式；
-> - 客户端 bundle 的更新与热加载行为；
-> - 与真实 DSH 版本升级后的兼容性。
+> - 完整工作流：导入脚手架包 → 关联 → 生成文件 → 启用 → 休眠 → 恢复（目前只经过假宿主测试）；
+> - 浏览器面板的真实渲染与交互；
+> - 重启后的状态对账；
+> - 与具体 DSH 版本升级后的兼容性。
 >
-> 详细说明与后续验证清单见 [docs/verification.md](docs/verification.md)。
+> 详细说明、缺陷记录与后续验证清单见 [docs/verification.md](docs/verification.md)。
 
 把 DSH **工程**（Workspace）与工程使用的**脚手架插件**关联起来的插件。
 
@@ -60,7 +58,7 @@
 # 在 DSH 中通过插件管理器安装本目录或发行包
 dsh plugin add /absolute/path/to/dsh-workspace-scaffolds
 # 或安装打包好的发行包
-dsh plugin add ./dsh-workspace-scaffolds-0.1.2.tgz
+dsh plugin add ./dsh-workspace-scaffolds-0.1.3.tgz
 ```
 
 安装后需要为本插件启用 bundle（默认 `cordis.patch.yml` 已声明）。面板出现在 **插件页 → 本插件卡片**，使用 `plugins.bundle.config` 插槽。
@@ -197,10 +195,10 @@ node --test test/*.test.mjs
 
 | 验证了什么 | 没验证什么 |
 |---|---|
-| 72 项 `node:test` 用例全部通过 | 真实 DSH 中的安装与加载 |
-| Linux（Node 22 / 24）与 Windows 上均通过 | 真实插件管理器的启停与重启行为 |
-| 真实 `src/host.js` 适配层被实际执行（非桩替换） | 浏览器面板的真实渲染与交互 |
-| 发行包可解包、可 `import`、`apply` 可挂载路由与工具 | 与具体 DSH 版本的兼容性 |
+| 75 项 `node:test` 用例全部通过 | 完整工作流在真实工程上跑通 |
+| Linux（Node 22 / 24）与 Windows 上均通过 | 浏览器面板的真实渲染与交互 |
+| 真实 `src/host.js` 适配层被实际执行（非桩替换） | 重启后的状态对账 |
+| **已在真实 DSH 中热载入并响应接口**（见 docs/verification.md） | 与具体 DSH 版本升级后的兼容性 |
 
 测试覆盖的验收场景与结果见 [docs/verification.md](docs/verification.md)。测试使用内存假宿主验证真实的 `src/host.js` 适配层，因此原生 `installBundle(..., {enabled:false})` 这类契约本身也在测试范围内。
 

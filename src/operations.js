@@ -126,6 +126,23 @@ export class Operations {
       if (!Number.isInteger(request.expectedRevision)) {
         throw new Fault(CODES.invalidRequest, { field: 'expectedRevision' });
       }
+      // Both guards are applied here, once, in this order, rather than inside
+      // each action:
+      //
+      // 1. A recorded operationId with identical arguments is a retry and must
+      //    return its original outcome even though the revision has moved on.
+      // 2. Otherwise a stale revision is refused *before* the action runs. An
+      //    action that would have been a harmless no-op (sleep on a workspace
+      //    with no association) still reports the conflict, so a caller can
+      //    never mistake "your snapshot was stale" for "everything was fine".
+      const replayed = this.#replayOf(action, request);
+      if (replayed !== null) return replayed;
+      if (request.expectedRevision !== this.store.revision) {
+        throw new Fault(CODES.revisionConflict, {
+          expectedRevision: request.expectedRevision,
+          currentRevision: this.store.revision,
+        });
+      }
     }
     switch (action) {
       case 'list':
@@ -369,8 +386,6 @@ export class Operations {
     if (typeof args.path !== 'string' || args.path.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'path' });
     }
-    const replay = this.#replayOf('import', request);
-    if (replay !== null) return replay;
 
     const imported = await importFromPath(this.store, args.path);
     const key = packageKey(imported.name, imported.version);
@@ -478,8 +493,6 @@ export class Operations {
     if (typeof args.workspaceId !== 'string' || args.workspaceId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'workspaceId' });
     }
-    const replay = this.#replayOf('bind', request);
-    if (replay !== null) return replay;
     const binding = readBindRequest(args);
     const workspace = this.host.getWorkspace(args.workspaceId);
     const state = this.store.snapshot();
@@ -565,8 +578,6 @@ export class Operations {
     if (typeof args.workspaceId !== 'string' || typeof args.bindingId !== 'string') {
       throw new Fault(CODES.invalidRequest, { field: 'bindingId' });
     }
-    const replay = this.#replayOf('unbind', request);
-    if (replay !== null) return replay;
     const state = this.store.snapshot();
     if (state.workspaces[args.workspaceId] === undefined) {
       throw new Fault(CODES.workspaceNotFound, { workspaceId: args.workspaceId });
@@ -617,8 +628,6 @@ export class Operations {
         throw new Fault(CODES.invalidRequest, { field });
       }
     }
-    const replay = this.#replayOf('update-binding', request);
-    if (replay !== null) return replay;
     const committed = await this.store.mutate(
       { action: 'update-binding', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
       (draft) => {
@@ -650,8 +659,6 @@ export class Operations {
     if (args.ownership !== undefined && !['managed', 'external'].includes(args.ownership)) {
       throw new Fault(CODES.invalidRequest, { field: 'ownership' });
     }
-    const replay = this.#replayOf('set-pin', request);
-    if (replay !== null) return replay;
     const committed = await this.store.mutate(
       { action: 'set-pin', operationId: request.operationId, expectedRevision: request.expectedRevision, args: canonicalArgs(request) },
       (draft) => {
@@ -675,8 +682,6 @@ export class Operations {
     if (typeof args.workspaceId !== 'string' || args.workspaceId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'workspaceId' });
     }
-    const replay = this.#replayOf('wake', request);
-    if (replay !== null) return replay;
     this.sleepQueue?.cancel(args.workspaceId);
     const outcome = await this.#enableForWorkspace(args.workspaceId, args);
     const committed = await this.store.mutate(
@@ -842,8 +847,6 @@ export class Operations {
     if (typeof args.workspaceId !== 'string' || args.workspaceId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'workspaceId' });
     }
-    const replay = this.#replayOf('sleep', request);
-    if (replay !== null) return replay;
     const state = this.store.snapshot();
     if (state.workspaces[args.workspaceId] === undefined) {
       return { workspaceId: args.workspaceId, status: 'no-op', reason: 'unassociated' };
@@ -986,8 +989,6 @@ export class Operations {
     if (typeof args.previewId !== 'string' || args.previewId.length === 0) {
       throw new Fault(CODES.invalidRequest, { field: 'previewId' });
     }
-    const replay = this.#replayOf('template-apply', request);
-    if (replay !== null) return replay;
     const preview = this.store.takePreview(args.previewId);
     if (preview.blocking.length > 0) {
       throw new Fault(CODES.templateConflict, { blocking: preview.blocking });
@@ -1032,8 +1033,6 @@ export class Operations {
     if (typeof args.archiveSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(args.archiveSha256)) {
       throw new Fault(CODES.invalidRequest, { field: 'archiveSha256' });
     }
-    const replay = this.#replayOf('delete-archive', request);
-    if (replay !== null) return replay;
     const state = this.store.snapshot();
     const holders = Object.entries(state.packages)
       .filter(([, record]) => record.archiveSha256 === args.archiveSha256)

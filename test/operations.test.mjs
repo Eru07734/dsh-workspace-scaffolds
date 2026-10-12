@@ -411,6 +411,80 @@ test('A22: a sleeping workspace restores its association after a restart', async
   }
 });
 
+test('a stale revision is refused even when the action would have been a no-op', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const snapshot = await operations.execute({ action: 'list' });
+    // Sleeping a workspace with no association writes nothing and is reported
+    // as a no-op. It must still refuse a stale revision: otherwise a caller
+    // whose snapshot is out of date receives a success and learns nothing.
+    await assert.rejects(
+      operations.execute({
+        action: 'sleep',
+        workspaceId: 'never-associated',
+        operationId: newId(),
+        expectedRevision: snapshot.revision + 99,
+      }),
+      (error) => error.code === CODES.revisionConflict,
+    );
+    // The same call at the correct revision is still the documented no-op.
+    const accepted = await operations.execute({
+      action: 'sleep',
+      workspaceId: 'never-associated',
+      operationId: newId(),
+      expectedRevision: snapshot.revision,
+    });
+    assert.deepEqual(accepted, { workspaceId: 'never-associated', status: 'no-op', reason: 'unassociated' });
+    const after = await operations.execute({ action: 'list' });
+    assert.equal(after.revision, snapshot.revision, 'a no-op must not bump the revision');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('a wake with a stale revision reports the conflict, not the missing workspace', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const snapshot = await operations.execute({ action: 'list' });
+    await assert.rejects(
+      operations.execute({
+        action: 'wake',
+        workspaceId: 'never-associated',
+        operationId: newId(),
+        expectedRevision: snapshot.revision + 1,
+      }),
+      (error) => error.code === CODES.revisionConflict,
+    );
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('a replayed operationId still wins over a stale revision', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'one'), 'one');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    const snapshot = await operations.execute({ action: 'list' });
+    const request = {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+      operationId: newId(),
+      expectedRevision: snapshot.revision,
+    };
+    const first = await operations.execute(request);
+    // The retry carries the now-stale revision. Replay must still return the
+    // recorded result, because the idempotency log is consulted first.
+    const second = await operations.execute(request);
+    assert.deepEqual(second, first);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('archive deletion is refused while a package still names it', async () => {
   const { fake, operations } = await setup();
   try {

@@ -1,11 +1,72 @@
 # 验证记录
 
-> ## 状态：**未经验证 · UNVERIFIED**
+> ## 状态：**仅部分验证 · PARTIALLY VERIFIED**
 >
-> 本插件**从未在真实的 DSH 环境中安装或运行过**。本文件记录的是**假宿主上的自动化验证**：它能证明代码逻辑自洽、边界处理正确，**不能**证明本插件在真实 DSH 中可用。
+> 本插件已在**真实 DSH**（profile `desktop`）中安装并热载入成功。宿主侧的安装、加载、HTTP 接口、原生服务解析与错误处理已有实测证据；**核心工作流（导入 → 关联 → 生成 → 启用 → 休眠 → 恢复）与浏览器面板仍未在真实环境跑通**，目前只有假宿主上的自动化证据。
 >
-> 本项目 v0.1.0 发布时未附此声明，v0.1.1 起补齐。请按实验性代码对待。
+> 本项目 v0.1.0 发布时未附声明，v0.1.1 起补齐；v0.1.3 起由「未验证」更新为「部分验证」。
+
 本文件记录 `dsh-workspace-scaffolds` 的验证方式、覆盖范围与当前结论。
+
+## 真实环境实测
+
+2026-10-12，在本机 DSH（`DSH_PROFILE=desktop`，`DSH_HOME=D:\dsh-home-desktop`）上执行。
+
+**安装**（经 `pluginManager/installBundle`，spec 为本地 `.tgz`）：
+
+```
+stage=enable  target=dsh-workspace-scaffolds  enabled=true  changed=true
+application=applied          <-- 热载入，无需重启
+packageResult.exitCode=0
+warnings=[]
+```
+
+**加载结果**（`pluginManager/listPlugins`）：
+
+```
+entryId=include:workspace-scaffolds  moduleName=dsh-workspace-scaffolds  enabled=true  fiberPhase=active
+```
+
+`fiberPhase=active` 说明条目真的挂上了，而不只是写进了配置。
+
+**HTTP 接口**（带会话 Cookie 的真实请求）：
+
+```
+GET /api/workspace-scaffolds/state -> HTTP 200
+{"ok":true,"value":{"revision":0,"profileName":"desktop", ... ,
+ "capabilities":{"pluginManager":true,"workspaceRegistry":true},
+ "workspaces":[], "unmanagedWorkspaces":[{"title":"Artex改","path":"D:\\Artex改"}, ...]}}
+```
+
+证明：两个原生服务都解析成功；能读取真实工程注册表；`runningAgents` 正确反映当前有 agent 在跑。
+
+**错误路径**（实测）：
+
+| 调用 | 结果 | 判定 |
+|---|---|---|
+| 缺 `operationId` | 400 `invalid-request {field: operationId}` | ✅ |
+| 未知 action | 400，并列出允许的 action | ✅ |
+| 过期 revision 的 `sleep` | **200 no-op** | ❌ 缺陷，见下 |
+| 正确 revision 的 `sleep`（未关联工作区） | 200 `{status: no-op, reason: unassociated}`，revision 不变 | ✅ |
+
+## 真实环境发现并已修复的缺陷
+
+### 缺陷 2：过期 revision 在 no-op 路径上被忽略
+
+**现象**：带 `expectedRevision = revision + 99` 的 `sleep` 返回 **HTTP 200 成功**，而不是 `revision-conflict`。
+
+**根因**：revision 校验只发生在 `store.mutate()` 内部。`#sleep` 对「工作区未关联」这一分支在调用 `mutate` **之前**就返回了，于是校验被完全绕过。`#wake` 有同样的顺序问题，且会先抛 `workspace-not-found`，把 revision 冲突掩盖成另一种错误。
+
+**为什么危险**：调用方会收到一个成功，却无从知道自己的快照是过期的。no-op 本身不写任何东西、不会丢更新，所以危害不是数据损坏，而是**把「你的状态已过期」误报成「一切正常」**，让真实的并发问题在更晚、更难定位的地方才暴露。
+
+**修复**：把重放检查与 revision 检查**上移到 `execute()`**，对所有写动作统一、按固定顺序执行：
+
+1. 先查幂等日志——`operationId` 相同且参数相同即为重试，必须返回原结果，即便 revision 已经前进；
+2. 再校验 revision——过期即拒绝，**无论该动作是否本来会 no-op**。
+
+同时删除了九个写动作内部重复的重放检查（已不可达）。
+
+**回归测试**（`test/operations.test.mjs`）：三项，分别锁定「过期 revision 即使会 no-op 也必须拒绝」「`wake` 的过期 revision 报冲突而不是找不到工作区」「重放仍优先于 revision 校验」。修复前的行为就是实测到的 200。
 
 ## 运行方式
 
@@ -51,8 +112,8 @@ node --test test/*.test.mjs
 ## 当前结果
 
 ```
-ℹ tests 72
-ℹ pass 72
+ℹ tests 75
+ℹ pass 75
 ℹ fail 0
 ```
 
@@ -114,31 +175,40 @@ d3fa6c6d2398d7c4d69b1e62e67ffa8929874ab1fc3b75f8706bdf4a3436d034
 - `ctx.profileContext` 由宿主 `provide`，提供 `dir` / `name` / `home`。
 - `plugins.bundle.config` 是 keyed 插槽，key 为 bundle 包名。
 
-## 尚未在真实 DSH 中验证的部分
+## 仍未在真实 DSH 中验证的部分
 
-以下内容需要一次真实的 DSH 会话才能确认，本文件明确记录为**未验证**：
+§真实环境实测 已确认下列第 1、2 项（就本插件自身的安装与加载而言）；其余仍然待验证：
 
-1. 真实 profile 中通过 `pnpm` 安装 `.tgz` 的端到端表现（测试用假宿主在内存中复现了同样的契约）。
-2. 真实插件管理器的启用／停用行为，以及 `restart-required` 的实际表现。
-3. `agent/created` 中调用 `setBundleEnabled` 与原生 HMR 锁的实际顺序（实现已加 15 秒预算与降级上报，避免挂起）。
-4. 面板在真实浏览器中的渲染、交互与样式（已用真实载荷做渲染级验证，但未做视觉验证）。
-5. 客户端 bundle 的更新与热加载行为：本插件是普通 bundle，改动需要重新安装并刷新页面。
-6. 与具体 DSH 版本升级后的兼容性。
+1. ~~真实 profile 中通过 `pnpm` 安装 `.tgz` 的端到端表现~~ —— **已验证**：pnpm 从本地 `.tgz` 安装成功，`exitCode=0`。
+2. ~~真实插件管理器的启用行为~~ —— **已验证**：`application="applied"`，条目 `fiberPhase=active`。**停用行为尚未验证**（`setBundleEnabled(name,false)` 的真实返回）。
+3. **完整工作流**：导入示例包 → 关联真实工程 → 生成文件 → 启用该脚手架 bundle → 休眠 → 恢复。目前只有假宿主证据。
+4. `agent/created` 中调用 `setBundleEnabled` 与原生 HMR 锁的实际顺序（实现已加 15 秒预算与降级上报，避免挂起）。
+5. 面板在真实浏览器中的渲染、交互与样式（已用真实载荷做渲染级验证，但未做视觉验证）。
+6. 客户端 bundle 的更新与热加载行为：本插件是普通 bundle，改动需要重新安装并刷新页面。
+7. **重启后的状态对账**：`<profileDir>/workspace-scaffolds/state.json` 在真实重启后的恢复表现。
+8. 与具体 DSH 版本升级后的兼容性。
 
 ## 结论
 
-**本项目未经验证。** 现有的自动化证据只支持一个结论：核心闭环（关联 → 生成 → 启用 → 休眠 → 恢复）的**逻辑**在假宿主上是自洽的——并发冲突、幂等重放、路径穿越、归档安全、状态损坏恢复、多工程共享与休眠排队都有回归保护。它**不**支持「这个插件能在真实 DSH 里正常工作」这一结论。
+**部分验证。** 已有证据支持：
+
+- **宿主编译期之外的真实运行**：本插件能在真实 profile 中安装、热载入（无需重启）、挂载 loader 条目、解析两个原生服务、读取真实工程注册表、通过 HTTP 接口正确返回数据，并对非法输入返回正确错误码。
+- **逻辑正确性**：核心闭环（关联 → 生成 → 启用 → 休眠 → 恢复）在假宿主上自洽——并发冲突、幂等重放、路径穿越、归档安全、状态损坏恢复、多工程共享与休眠排队都有回归保护。
+
+证据**不**支持：完整工作流在真实工程上可用、浏览器面板可用、重启后状态对账正确。这两类缺口性质不同——前者是逻辑，后者是集成。
+
+值得注意的是，**两项真实缺陷都不是假宿主测试发现的**：一项由 CI（跨秒边界）发现，一项由真实 DSH 实测（no-op 路径绕过 revision 校验）发现。这说明集成验证不可省略。
 
 ## 完成验证需要做什么
 
-按顺序执行，每步记录实际输出：
+按顺序执行，每步记录实际输出。**第 1 步已完成，从第 2 步继续**：
 
-1. 在**非关键 profile** 中 `dsh plugin add` 本发行包，确认能够加载、面板出现在插件页且不报错。
-2. 导入 `examples/dsh-scaffold-notes`，关联到一个测试工程，走完 预览 → 生成 → 恢复 → 休眠 → 再恢复。
+1. ~~安装本发行包~~ —— **已完成**（`application=applied`，无需重启）。
+2. 导入 `examples/dsh-scaffold-notes`，关联到一个**测试**工程，走完 预览 → 生成 → 恢复 → 休眠 → 再恢复。
 3. 确认休眠后 bundle 在原生插件页显示为停用，且安装仍保留；再确认恢复后工具真实可用（不是仅状态显示为启用）。
 4. 在两个工程共享同一个包的条件下重复休眠／恢复，确认不会互相误停用。
 5. 在真实浏览器中检查面板的布局、变量输入与错误提示。
 6. 重启 DSH，确认关联、版本与运行状态对账正确。
-7. 若第 3 或第 6 步失败，请连同 `plugin-manager` 的 `application` 返回值一起记录——那正是本插件依赖但尚未实测的接口行为。
+7. 若第 3 或第 6 步失败，请连同 `plugin-manager` 的 `application` 返回值一起记录。
 
-完成上述步骤后，请把结论写回本文件，并移除 README 顶部的未验证声明。
+完成上述步骤后，请把结论写回本文件，并相应更新 README 顶部的状态声明。
