@@ -122,10 +122,57 @@ node --test test/*.test.mjs
 ## 当前结果
 
 ```
-ℹ tests 83
-ℹ pass 83
+ℹ tests 85
+ℹ pass 85
 ℹ fail 0
 ```
+
+## 自举测试：用本插件管理它自己的工程
+
+2026-10-12，把插件仓库 `C:\Users\jyj20\DSH 插件\dsh-workspace-scaffolds` 注册为 DSH 工程（`workspaceId = 0b97b770-1295-4098-ac7e-badebb9be055`），然后用本插件管理它自己。
+
+已完成并在真实环境中验证：
+
+| 步骤 | 结果 |
+|---|---|
+| 导入两个示例包 | `installOutcome=applied`，`nativeEnabled=false`（安装与启用分离），内容哈希 `1c7ee7c5…`、`93fdad26…` |
+| 关联到工程 | 两个 binding 建立成功 |
+| 读取模板描述 | 变量正确读出：notes 有 `projectName`/`owner`，checks 只有 `projectName` |
+| 生成预览 | 3 个文件全部 `create`，无冲突 |
+| 应用模板 | `created=["docs/PROJECT-NOTES.md","docs/DECISIONS.md"]`、`["docs/CHECKS.md"]` |
+| 变量替换 | 生成内容为 `# dsh-workspace-scaffolds · 工程笔记`、`负责人：Eru07734` |
+| 延迟休眠 | 有 agent 在跑时返回 `pending-idle` 并排队，bundle 保持 enabled，`ready=false` |
+
+**这一步立刻抓出了缺陷 4**（见下）。两个示例包的预览与应用路径是正确的；缺陷出在恢复（启用）环节。
+
+## 缺陷 4：唤醒时把自己刚启用的包误判为「外部启用」并钉住
+
+**现象**：`wake` 返回 `409 revision-conflict`。操作日志给出了直接证据：
+
+```
+reconcile  result={"drift":[{"key":"dsh-scaffold-notes@0.1.0",
+             "change":"enabled-outside-management","action":"pinned"}]}
+```
+
+`dsh-scaffold-notes` 的 `pinned` 变成 `true`。而 `pinned` 的包 `sleep` 永远不会停用——**整个「休眠」功能对它失效**，而休眠正是本插件存在的理由。
+
+**根因**：`plugin-manager/changed` 对**每一次**写入都会发出，包括本插件自己的写入。于是链条成为：
+
+1. `wake` 调用 `setBundleEnabled` → 原生发出 `plugin-manager/changed`；
+2. 本插件的 `reconcile` 监听器被触发，去读状态；
+3. 此刻 `wake` 的 `requestedState=awake` 还没提交（它的 mutate 被这次 reconcile 挤掉，正是那个 409）；
+4. reconcile 看到「包已启用、但没有任何活跃工作区认领」→ 判定为外部意图 → pin。
+
+**为什么这是最严重的一个**：它不报错、不崩溃，只是**静默地把核心功能关掉**。而且它是竞态——reconcile 读到的是两次启用之间的快照，两个包里只有先被看到那个被钉住，所以可能钉 0 个、1 个或 2 个。
+
+**修复（两处，均已验证各自承重）**：
+
+1. **归属**：本插件自己的原生写操作包在 `#nativeWrite` 里计数；写入期间到达的变更事件被推迟，等**整个操作**提交完自己的状态后再统一结算（`#drainReconcile` 放在 `execute()` 的 `finally`，而不是放在原生写之后）。
+2. **租约解释权**：`reconcile` 不再把「已启用且无人认领」直接当作外部意图——只要存在租约，启用就是被解释的。提交时再复查一次租约，堵住读与写之间的缝隙。
+
+**验证**：拆掉第 1 处 → 回归测试失败；拆掉第 2 处（含提交时复查）→ 回归测试失败；只拆外层那一处则仍通过，因为内层复查兜住了，属纵深防御。同时补了一条反向测试：**无人认领的启用仍必须被保护**（不得停用不是自己开的东西），确保修复没有把安全规则一起削掉。
+
+**教训**：`wake` 里「先启用、后提交意图」的顺序本身就把两者之间的窗口暴露给了任何监听器。这类自指事件流（自己的写触发自己的监听器）在假宿主上完全测不出来——测试必须显式模拟「原生为自己的写入发出变更事件」，否则这条路径永远不被覆盖。已把该模拟加进假宿主。
 
 ## CI 发现并已修复的缺陷
 

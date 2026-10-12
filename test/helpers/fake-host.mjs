@@ -59,6 +59,9 @@ export async function createFakeHost(options = {}) {
   const packageDirs = new Map();
   const calls = [];
 
+  /** Called after every native enablement change, like the real plugin manager. */
+  let onPluginManagerChange = null;
+
   const pluginManager = {
     async listBundles() {
       return [...bundles.values()].map((row) => ({
@@ -75,6 +78,10 @@ export async function createFakeHost(options = {}) {
       const row = bundles.get(name);
       if (row === undefined) throw new Error(`unknown bundle ${name}`);
       row.enabled = enabled;
+      // The real manager emits `plugin-manager/changed` for every write,
+      // including the ones this plugin performs. Reproducing that here is what
+      // makes the self-attribution race testable at all.
+      if (onPluginManagerChange !== null) onPluginManagerChange({ name, enabled });
       return { application: 'applied', changed: true };
     },
     /**
@@ -137,6 +144,13 @@ export async function createFakeHost(options = {}) {
     bundles,
     agents,
     calls,
+    /**
+     * Subscribe to enablement changes the way `plugin-manager/changed` does.
+     * @param {(event: {name: string, enabled: boolean}) => void} listener
+     */
+    onPluginManagerChange(listener) {
+      onPluginManagerChange = listener;
+    },
     workspace: {
       /** Register a directory as a workspace. @param {string} path @param {string} [title] */
       async add(path, title) {

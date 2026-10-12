@@ -172,10 +172,13 @@ export function apply(ctx) {
   });
 
   ctx.on('plugin-manager/changed', () => {
-    // Another surface changed enablement. Reconciliation re-reads the native
-    // inventory and never fights the other writer.
+    // Another surface changed enablement - or this plugin itself just did. The
+    // operations layer holds back the events its own writes cause, so a change
+    // it applied is never mistaken for intent from somewhere else. Reconciling
+    // on the raw event made a wake pin the very bundle it had enabled, which
+    // permanently stopped that bundle from being shelved.
     void ensureReady()
-      .then(() => operations.execute({ action: 'reconcile' }))
+      .then(() => operations.reconcileFromEvent())
       .catch(() => {});
   });
 

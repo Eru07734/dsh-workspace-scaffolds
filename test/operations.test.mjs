@@ -446,6 +446,75 @@ test('list reports the running build and the profile-declared spec', async () =>
   }
 });
 
+test('a wake must not pin the bundle it just enabled', async () => {
+  const { fake, operations } = await setup();
+  try {
+    // Reproduce the real event flow: the plugin manager announces every
+    // enablement change, including the ones this plugin causes, and the change
+    // listener reconciles on that announcement.
+    fake.onPluginManagerChange(() => {
+      void operations.reconcileFromEvent();
+    });
+
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'one'), 'one');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+
+    let snapshot = await operations.execute({ action: 'list' });
+    const record = snapshot.packages.find((entry) => entry.key === 'dsh-scaffold-notes@0.1.0');
+    assert.equal(record.enabled, true);
+    assert.equal(
+      record.pinned,
+      false,
+      'a bundle this plugin enabled for an awake workspace is explained by that lease, not by outside intent',
+    );
+
+    // The consequence that matters: shelving must still work.
+    const slept = await write(operations, { action: 'sleep', workspaceId: workspace.workspaceId });
+    assert.deepEqual(slept.release.released, [{ key: 'dsh-scaffold-notes@0.1.0', outcome: 'applied' }]);
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, false);
+    snapshot = await operations.execute({ action: 'list' });
+    assert.equal(snapshot.packages.find((entry) => entry.key === 'dsh-scaffold-notes@0.1.0').pinned, false);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('a bundle enabled with no workspace claiming it is still treated as external intent', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'one'), 'one');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+
+    // Someone else turns it on while no workspace holds a lease. The safety
+    // rule must still protect that: do not disable what we did not enable.
+    fake.bundles.get('dsh-scaffold-notes').enabled = true;
+    const reconciled = await operations.reconcileFromEvent();
+    assert.ok(reconciled !== null && reconciled !== undefined);
+    assert.equal(reconciled.drift.length, 1);
+    assert.equal(reconciled.drift[0].change, 'enabled-outside-management');
+    const snapshot = await operations.execute({ action: 'list' });
+    assert.equal(snapshot.packages.find((entry) => entry.key === 'dsh-scaffold-notes@0.1.0').pinned, true);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('a stale revision is refused even when the action would have been a no-op', async () => {
   const { fake, operations } = await setup();
   try {

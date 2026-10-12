@@ -66,6 +66,12 @@ export function canonicalArgs(request) {
  * Owns the plugin's behaviour. One instance per applied plugin.
  */
 export class Operations {
+  /** Depth of in-flight native writes whose change events must be held back. */
+  #nativeDepth = 0;
+
+  /** Whether a change event arrived during a native write and still needs a pass. */
+  #reconcileWanted = false;
+
   /**
    * @param {{host: object, store: import('./store.js').Store, activity: import('./lifecycle.js').Activity}} deps
    */
@@ -131,6 +137,61 @@ export class Operations {
   }
 
   /**
+   * Run a native enable/disable/install while this plugin's own change events
+   * are held back.
+   *
+   * The plugin manager emits `plugin-manager/changed` for every write,
+   * including ours. Without this guard the reconciliation triggered by our own
+   * wake would observe a bundle that no workspace claims yet (the awake intent
+   * is committed afterwards) and conclude it was enabled externally, pinning
+   * it - which permanently defeats shelving for exactly the bundles this plugin
+   * turned on.
+   * @template T
+   * @param {() => Promise<T>} operation
+   * @returns {Promise<T>}
+   */
+  async #nativeWrite(operation) {
+    this.#nativeDepth += 1;
+    try {
+      return await operation();
+    } finally {
+      this.#nativeDepth -= 1;
+    }
+  }
+
+  /**
+   * Run a reconciliation that arrived during a native write, once the operation
+   * that caused it has finished committing its own state.
+   *
+   * Draining this at the end of the *operation* rather than at the end of the
+   * native write is what makes the lease-aware check effective: by then `wake`
+   * has committed the awake intent, so a lease explains the bundle this plugin
+   * just enabled.
+   * @returns {Promise<void>}
+   */
+  async #drainReconcile() {
+    if (this.#nativeDepth > 0 || !this.#reconcileWanted) return;
+    this.#reconcileWanted = false;
+    await this.#reconcile().catch(() => {});
+  }
+
+  /**
+   * Entry point for the plugin-manager change listener.
+   *
+   * A change this plugin caused is deferred until the operation that caused it
+   * has finished, so reconciliation always judges a settled state rather than a
+   * half-applied one.
+   * @returns {Promise<object|null>} The reconciliation, or null when deferred.
+   */
+  async reconcileFromEvent() {
+    if (this.#nativeDepth > 0) {
+      this.#reconcileWanted = true;
+      return null;
+    }
+    return await this.#reconcile();
+  }
+
+  /**
    * Dispatch one request.
    * @param {object} request `{action, operationId?, expectedRevision?, ...args}`
    * @returns {Promise<any>}
@@ -166,6 +227,20 @@ export class Operations {
         });
       }
     }
+    try {
+      return await this.#dispatch(action, request);
+    } finally {
+      await this.#drainReconcile();
+    }
+  }
+
+  /**
+   * Route one validated action to its handler.
+   * @param {string} action
+   * @param {object} request
+   * @returns {Promise<any>}
+   */
+  async #dispatch(action, request) {
     switch (action) {
       case 'list':
         return await this.#list();
@@ -437,9 +512,11 @@ export class Operations {
     const before = evaluatePackage(bundles, imported.name, imported.version);
     let installOutcome = 'skipped';
     if (args.install !== false && before.status === 'absent') {
-      const result = await this.host.installBundle(archivePath(this.store, imported.archiveSha256), {
-        requestId: request.operationId,
-      });
+      const result = await this.#nativeWrite(() =>
+        this.host.installBundle(archivePath(this.store, imported.archiveSha256), {
+          requestId: request.operationId,
+        }),
+      );
       installOutcome = typeof result?.application === 'string' ? result.application : 'installed';
     } else if (before.status === 'mismatch') {
       throw new Fault(CODES.versionConflict, {
@@ -784,7 +861,7 @@ export class Operations {
             failures.push({ key: step.key, code: fault.code, details: fault.details });
             continue;
           }
-          await this.host.installBundle(archivePath(this.store, sha), {});
+          await this.#nativeWrite(() => this.host.installBundle(archivePath(this.store, sha), {}));
           bundles = await readBundles(this.host);
           evaluated = evaluatePackage(bundles, step.packageName, step.version);
           if (evaluated.status !== 'match') {
@@ -803,7 +880,7 @@ export class Operations {
           applied.push({ key: step.key, application: 'already-enabled' });
           continue;
         }
-        const result = await this.host.setBundleEnabled(step.packageName, true);
+        const result = await this.#nativeWrite(() => this.host.setBundleEnabled(step.packageName, true));
         const application = typeof result?.application === 'string' ? result.application : 'applied';
         newlyEnabled.push(step.packageName);
         applied.push({ key: step.key, application, warnings: jsonSafe(result?.warnings ?? null) });
@@ -859,7 +936,7 @@ export class Operations {
         continue;
       }
       try {
-        await this.host.setBundleEnabled(name, false);
+        await this.#nativeWrite(() => this.host.setBundleEnabled(name, false));
         disabled.push(name);
       } catch (error) {
         kept.push({ name, reason: 'compensation-failed', detail: error instanceof Error ? error.message : String(error) });
@@ -908,7 +985,13 @@ export class Operations {
    * @returns {Promise<object>}
    */
   async #applyDeferredSleep(workspaceId, trigger) {
-    return await this.#releaseForWorkspace(workspaceId, trigger);
+    // Deferred work runs outside `execute()`, so it drains the change events its
+    // own native writes produced rather than leaving them pending.
+    try {
+      return await this.#releaseForWorkspace(workspaceId, trigger);
+    } finally {
+      await this.#drainReconcile();
+    }
   }
 
   /**
@@ -957,7 +1040,7 @@ export class Operations {
         continue;
       }
       try {
-        const result = await this.host.setBundleEnabled(name, false);
+        const result = await this.#nativeWrite(() => this.host.setBundleEnabled(name, false));
         const application = typeof result?.application === 'string' ? result.application : 'applied';
         released.push({ key, outcome: application });
         if (application === 'failed' || application === 'cancelled') {
@@ -1102,13 +1185,19 @@ export class Operations {
   async #reconcile() {
     const state = this.store.snapshot();
     const bundles = await readBundles(this.host).catch(() => new Map());
+    const leases = leasesOf(state);
     const drift = [];
     for (const [key, record] of Object.entries(state.packages)) {
       const { name, version } = parsePackageKey(key);
       const evaluated = evaluatePackage(bundles, name, version);
-      if (evaluated.enabled && record.ownership === 'managed' && !record.pinned) {
-        // Something enabled a package we thought was ours to manage. Treat that
-        // as a global intent and stop treating it as a release candidate.
+      const holders = leases.get(key) ?? [];
+      // A lease is the explanation for an enabled bundle: an awake workspace
+      // asked for it. Only an enabled bundle that *nothing* claims is evidence
+      // of intent from outside this plugin. Without this check, a bundle this
+      // plugin just enabled would be judged external and pinned, which would
+      // permanently stop shelving it.
+      const unclaimed = holders.length === 0;
+      if (evaluated.enabled && record.ownership === 'managed' && !record.pinned && unclaimed) {
         drift.push({ key, change: 'enabled-outside-management', action: 'pinned' });
       }
       if (evaluated.status === 'absent' && record.restoreCapability === 'archived') {
@@ -1119,10 +1208,13 @@ export class Operations {
       await this.store.mutate(
         { action: 'reconcile', operationId: newId(), expectedRevision: this.store.revision },
         (draft) => {
+          // Re-check inside the write: a lease may have appeared between the
+          // read above and this commit.
+          const currentLeases = leasesOf(draft);
           for (const entry of drift) {
-            if (entry.action === 'pinned' && draft.packages[entry.key] !== undefined) {
-              draft.packages[entry.key].pinned = true;
-            }
+            if (entry.action !== 'pinned') continue;
+            if ((currentLeases.get(entry.key) ?? []).length > 0) continue;
+            if (draft.packages[entry.key] !== undefined) draft.packages[entry.key].pinned = true;
           }
           return { drift };
         },

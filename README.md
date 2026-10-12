@@ -58,7 +58,7 @@
 # 在 DSH 中通过插件管理器安装本目录或发行包
 dsh plugin add /absolute/path/to/dsh-workspace-scaffolds
 # 或安装打包好的发行包
-dsh plugin add ./dsh-workspace-scaffolds-0.1.4.tgz
+dsh plugin add ./dsh-workspace-scaffolds-0.1.5.tgz
 ```
 
 安装后需要为本插件启用 bundle（默认 `cordis.patch.yml` 已声明）。面板出现在 **插件页 → 本插件卡片**，使用 `plugins.bundle.config` 插槽。
@@ -211,7 +211,7 @@ node --test test/*.test.mjs
 
 | 验证了什么 | 没验证什么 |
 |---|---|
-| 83 项 `node:test` 用例全部通过 | 完整工作流在真实工程上跑通 |
+| 85 项 `node:test` 用例全部通过 | 浏览器面板的真实渲染与交互 |
 | Linux（Node 22 / 24）与 Windows 上均通过 | 浏览器面板的真实渲染与交互 |
 | 真实 `src/host.js` 适配层被实际执行（非桩替换） | 重启后的状态对账 |
 | **已在真实 DSH 中热载入并响应接口**（见 docs/verification.md） | 与具体 DSH 版本升级后的兼容性 |
