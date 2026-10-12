@@ -32,24 +32,71 @@ function octal(value, length) {
 
 /**
  * Split a POSIX relative path into USTAR name/prefix fields.
+ *
+ * An earlier version never reported the failure it could not solve: when no
+ * candidate prefix fitted the 155-byte `prefix` field it popped directory
+ * segments off the end and returned the shortened path. That "repair" is worse
+ * than refusing the entry, for two compounding reasons.
+ *
+ * First, the entry no longer describes the file it was built for. Two different
+ * sources can collapse onto one stored path - a deep directory and the file
+ * inside it both become the shallower directory's path - so the archive
+ * contradicts itself. Neither write is flagged: the collapsed entries differ
+ * only in the type flag of a header block that carries no distinguishing bytes,
+ * so `inspectTarball` rejects the tarball this module just produced. The
+ * package is unusable, and the only way to notice is a failed import.
+ *
+ * Second, it misreports why. The collision surfaces as
+ * `archive-invalid / duplicate-path`, which accuses the package of containing
+ * twice the same path when the real defect is a path too long for USTAR. The
+ * person holding that error looks for a duplicate in a package that has none,
+ * while the actionable fact - shorten or relocate the path - is erased by the
+ * truncation that created the collision. A path that did not fit must fail
+ * where it is still identifiable.
+ *
+ * The split is therefore searched, not guessed: walk the deepest candidate
+ * (every segment but the last in `prefix`) back towards the shallowest, and
+ * throw a `path-too-long` Fault when none fits. On failure we report the real
+ * byte counts, so the reason is visibly "too long" rather than a duplicate.
  * @param {string} relativePath
  * @returns {{name: string, prefix: string}}
  */
 function splitName(relativePath) {
-  if (Buffer.byteLength(relativePath, 'utf8') <= NAME_MAX) return { name: relativePath, prefix: '' };
+  const total = Buffer.byteLength(relativePath, 'utf8');
+  if (total <= NAME_MAX) return { name: relativePath, prefix: '' };
   const segments = relativePath.split('/');
-  let prefix = '';
-  while (segments.length > 1) {
-    const candidate = segments.slice(0, -1).join('/');
-    const name = segments.at(-1);
-    if (Buffer.byteLength(candidate, 'utf8') <= PREFIX_MAX && Buffer.byteLength(name, 'utf8') <= NAME_MAX) {
-      prefix = candidate;
+  const lastSegmentBytes = Buffer.byteLength(segments.at(-1), 'utf8');
+  /**
+   * Refuse the entry, naming the field that could not hold the path. A single
+   * over-long final segment breaks the `name` field by itself; with a separator
+   * present it can only be the split that failed to fit. The byte counts are
+   * included so the caller can see how far past the limit the path went.
+   */
+  const pathTooLong = () => new Fault(CODES.archiveInvalid, {
+    reason: 'path-too-long',
+    path: relativePath,
+    bytes: total,
+    field: lastSegmentBytes > NAME_MAX ? 'name' : 'prefix',
+    nameBytes: lastSegmentBytes,
+    nameLimit: NAME_MAX,
+    prefixLimit: PREFIX_MAX,
+  });
+  let prefixSegments = segments.length - 1;
+  while (prefixSegments > 0) {
+    const prefix = segments.slice(0, prefixSegments).join('/');
+    const name = segments.slice(prefixSegments).join('/');
+    if (Buffer.byteLength(prefix, 'utf8') <= PREFIX_MAX && Buffer.byteLength(name, 'utf8') <= NAME_MAX) {
       return { name, prefix };
     }
-    segments.pop();
+    // This split does not fit. Folding the next segment into `name` shortens
+    // `prefix` but lengthens `name`, so the search walks from the deepest split
+    // (whole path kept, `prefix` as long as possible) towards the shallowest.
+    prefixSegments -= 1;
   }
-  void prefix;
-  throw new Fault(CODES.archiveInvalid, { reason: 'path-too-long', path: relativePath });
+  // No split fits. Note this happens even when the final segment alone is well
+  // under 100 bytes: a path can be too long in total while every segment is
+  // short, which is exactly the case truncation used to paper over.
+  throw pathTooLong();
 }
 
 /**
@@ -180,8 +227,42 @@ export async function packDirectory(directory) {
  * @returns {number} Parsed octal field.
  */
 function readOctal(buffer, offset, length) {
+  // Octal digits are ASCII, so Latin-1 (a byte-for-byte view) is the exact
+  // decoder here. Do not "unify" this with the UTF-8 path decode below.
   const text = buffer.toString('latin1', offset, offset + length).replace(/\0.*$/, '').trim();
   return text === '' ? 0 : Number.parseInt(text, 8);
+}
+
+/**
+ * Decode a USTAR `name` or `prefix` field into text.
+ *
+ * USTAR has no encoding field. The de-facto convention — GNU tar, bsdtar and
+ * libarchive all follow it — is that these two fields hold UTF-8 bytes, and
+ * {@link header} writes them with `'utf8'`, so the reader must decode UTF-8 to
+ * return what the writer stored. Reading them as Latin-1 (the previous
+ * behaviour) mapped every non-ASCII byte to a different code point, so any
+ * non-ASCII path — a Chinese template target, a CJK filename inside a package —
+ * came back as mojibake that no longer matched the source path.
+ *
+ * Tradeoff for archives this module did not write: a tarball whose names are
+ * genuinely single-byte legacy bytes (Latin-1, CP1252, GBK, ...) is not valid
+ * UTF-8, and its bytes decode to U+FFFD REPLACEMENT CHARACTER rather than being
+ * guessed at. A "saw U+FFFD, retry as Latin-1" fallback was considered and
+ * rejected: U+FFFD is itself a legal filename character that a UTF-8 writer can
+ * emit on purpose (Node substitutes it for an unpaired surrogate), so the
+ * heuristic would silently corrupt correct archives of that shape while merely
+ * relocating the guesswork for the rest, and a guess made here cannot be undone
+ * after `extractTarball` has written the file. Deterministic, visible corruption
+ * on input that violates the convention beats a silent guess.
+ *
+ * Only `name` and `prefix` go through here. Every other header field (typeflag,
+ * octal numbers, magic, user/group names) is ASCII by construction and is read
+ * with Latin-1, which is a byte-for-byte view for those values.
+ * @param {Buffer} block @param {number} offset @param {number} length
+ * @returns {string} Field text, cut at the first NUL that terminates/pads it.
+ */
+function decodePathField(block, offset, length) {
+  return block.toString('utf8', offset, offset + length).replace(/\0.*$/, '');
 }
 
 /**
@@ -205,8 +286,8 @@ export function inspectTarball(buffer) {
     if (block.every((byte) => byte === 0)) break;
     const size = readOctal(block, 124, 12);
     const typeflag = block.toString('latin1', 156, 157);
-    const prefix = block.toString('latin1', 345, 345 + PREFIX_MAX).replace(/\0.*$/, '');
-    const name = block.toString('latin1', 0, NAME_MAX).replace(/\0.*$/, '');
+    const prefix = decodePathField(block, 345, PREFIX_MAX);
+    const name = decodePathField(block, 0, NAME_MAX);
     const full = prefix === '' ? name : `${prefix}/${name}`;
     const payload = offset + BLOCK;
     const next = payload + Math.ceil(size / BLOCK) * BLOCK;

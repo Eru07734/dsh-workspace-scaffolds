@@ -70,6 +70,36 @@ export async function createFakeHost(options = {}) {
    */
   let gateSetEnabled = null;
 
+  /**
+   * One-shot override for the next `installBundle` call. See
+   * `installBundleOutcome` on the returned object for the two shapes.
+   * @type {object|((installed: object) => object)|null}
+   */
+  let nextInstallOutcome = null;
+
+  /**
+   * The ordinary install: unpack the archive into the profile's `node_modules`
+   * and register the bundle, like the real manager.
+   * @param {string} spec
+   * @param {{enabled?: boolean}} installOptions
+   * @returns {Promise<object>}
+   */
+  async function installBundleForReal(spec, installOptions) {
+    const buffer = await readFile(spec);
+    const manifest = manifestOf(buffer);
+    const directory = join(profileDir, 'node_modules', ...manifest.name.split('/'));
+    await extractTarball(buffer, directory, (entryPath) => resolveInside(directory, entryPath));
+    packageDirs.set(manifest.name, directory);
+    bundles.set(manifest.name, {
+      name: manifest.name,
+      version: manifest.version,
+      enabled: installOptions.enabled !== false,
+      installed: true,
+      removable: true,
+    });
+    return { application: 'applied', bundle: manifest.name, target: manifest.name, stage: 'install' };
+  }
+
   const pluginManager = {
     async listBundles() {
       return [...bundles.values()].map((row) => ({
@@ -96,22 +126,17 @@ export async function createFakeHost(options = {}) {
     /**
      * Mirrors the native contract: `options.enabled !== false` activates the
      * bundle. The adapter is what passes `enabled:false`.
+     *
+     * The attempt is recorded in `calls` before any override applies, because
+     * the adapter's decision to call at all is itself under test.
      */
     async installBundle(spec, installOptions = {}) {
       calls.push({ kind: 'installBundle', spec, enabled: installOptions.enabled });
-      const buffer = await readFile(spec);
-      const manifest = manifestOf(buffer);
-      const directory = join(profileDir, 'node_modules', ...manifest.name.split('/'));
-      await extractTarball(buffer, directory, (entryPath) => resolveInside(directory, entryPath));
-      packageDirs.set(manifest.name, directory);
-      bundles.set(manifest.name, {
-        name: manifest.name,
-        version: manifest.version,
-        enabled: installOptions.enabled !== false,
-        installed: true,
-        removable: true,
-      });
-      return { application: 'applied', bundle: manifest.name, target: manifest.name, stage: 'install' };
+      const override = nextInstallOutcome;
+      nextInstallOutcome = null;
+      if (typeof override === 'function') return override(await installBundleForReal(spec, installOptions));
+      if (override !== null) return override;
+      return await installBundleForReal(spec, installOptions);
     },
   };
 
@@ -176,6 +201,26 @@ export async function createFakeHost(options = {}) {
      */
     gateSetBundleEnabled(gate) {
       gateSetEnabled = gate;
+    },
+    /**
+     * Control what the next native install reports.
+     *
+     * The native `application` decides whether an install actually happened, so
+     * the two accepted shapes differ on purpose:
+     *
+     * - an object is returned verbatim and *nothing* is installed. That is the
+     *   real contract for `application: 'failed' | 'cancelled'`: such a package
+     *   reaches neither the profile's dependencies nor its `node_modules`.
+     * - a function receives the result of a real install and returns what to
+     *   report instead, for outcomes that still install (e.g.
+     *   `restart-required`).
+     *
+     * The override is one-shot, so the call after it takes the ordinary path -
+     * which is exactly what a retry after a failure has to exercise.
+     * @param {object|((installed: object) => object)|null} outcome
+     */
+    installBundleOutcome(outcome) {
+      nextInstallOutcome = outcome;
     },
     workspace: {
       /** Register a directory as a workspace. @param {string} path @param {string} [title] */

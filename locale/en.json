@@ -30,6 +30,7 @@
   "importPath": "Path",
   "importRun": "Import",
   "intro": "Tie a workspace to its scaffold plugin bundles: prepare before work, add during work, shelve to disk when idle, and restore when you come back. Scaffold bundles are native DSH plugins shared by the whole profile; a shelf only disables one when no other workspace still needs it.",
+  "loadFailed": "Could not read the panel state",
   "loading": "Loading…",
   "missing": "The workspace directory is currently unavailable",
   "nativeAbsent": "absent",

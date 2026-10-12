@@ -5,7 +5,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Activity } from '../src/lifecycle.js';
 import { Operations } from '../src/operations.js';
@@ -1579,6 +1579,178 @@ test('F14: an optional association does not block readiness when its bundle is o
     assert.deepEqual(record.blockers.map((blocker) => blocker.code), ['not-enabled']);
     assert.equal(record.blockers[0].required, false);
     assert.equal(record.ready, true, 'an optional association that is off is reported, not blocking');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F08: an install the native manager reports as failed is refused, not recorded', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const packageDir = await notesPackage(fake.workspace.root);
+    const revisionBefore = operations.store.revision;
+    fake.installBundleOutcome({
+      application: 'failed',
+      error: { code: 'EACCES', message: 'the profile refused the install' },
+    });
+
+    await assert.rejects(
+      operations.execute({
+        action: 'import',
+        operationId: newId(),
+        expectedRevision: revisionBefore,
+        path: packageDir,
+      }),
+      (error) => {
+        assert.equal(error.code, CODES.nativeOperationFailed);
+        assert.equal(error.details.packageName, 'dsh-scaffold-notes');
+        assert.equal(error.details.version, '0.1.0');
+        assert.equal(error.details.application, 'failed');
+        assert.deepEqual(error.details.error, { code: 'EACCES', message: 'the profile refused the install' });
+        return true;
+      },
+    );
+
+    // `failed` means the package reached neither the profile nor its
+    // node_modules, so there is nothing for a package record to describe.
+    assert.equal(await packageRecord(operations, 'dsh-scaffold-notes@0.1.0'), undefined, 'no record may be written');
+    assert.equal(operations.store.revision, revisionBefore, 'a failed install must not bump the revision');
+    assert.equal(fake.bundles.has('dsh-scaffold-notes'), false, 'nothing was installed natively');
+    const profileDir = fake.ctx.get('profileContext').dir;
+    assert.equal(
+      await fileExists(join(profileDir, 'node_modules', 'dsh-scaffold-notes', 'package.json')),
+      false,
+      'nothing was unpacked into the profile',
+    );
+    // The warehouse keeps the snapshot the refused attempt staged: it is
+    // content-addressed and referenced by nothing, so a retry reuses these bytes.
+    assert.equal((await readdir(join(fake.host.storageDir, 'archives'))).length, 1);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F08: an install the native manager cancels is refused, not recorded', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const packageDir = await notesPackage(fake.workspace.root);
+    const revisionBefore = operations.store.revision;
+    fake.installBundleOutcome({ application: 'cancelled' });
+
+    await assert.rejects(
+      operations.execute({
+        action: 'import',
+        operationId: newId(),
+        expectedRevision: revisionBefore,
+        path: packageDir,
+      }),
+      (error) => {
+        assert.equal(error.code, CODES.nativeOperationFailed);
+        assert.equal(error.details.application, 'cancelled');
+        assert.equal(error.details.packageName, 'dsh-scaffold-notes');
+        // No `error` came back; the field is still present, and null.
+        assert.equal(error.details.error, null);
+        return true;
+      },
+    );
+
+    assert.equal(await packageRecord(operations, 'dsh-scaffold-notes@0.1.0'), undefined);
+    assert.equal(operations.store.revision, revisionBefore);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F08: an install that reports applied or restart-required is still a successful import', async () => {
+  const { fake, operations } = await setup();
+  try {
+    // The ordinary path, unchanged: the fake reports `applied` itself.
+    const appliedDir = await notesPackage(fake.workspace.root);
+    const applied = await write(operations, { action: 'import', path: appliedDir });
+    assert.equal(applied.installOutcome, 'applied');
+    assert.equal(applied.nativeEnabled, false);
+    const appliedRecord = await packageRecord(operations, applied.packageKey);
+    assert.equal(appliedRecord.archiveSha256, applied.archiveSha256, 'a success is still recorded');
+
+    // `restart-required` installs for real and only defers activation, so it is
+    // a success too and must not be swept up by the failure branch.
+    const restartedDir = await writeScaffoldPackage(join(fake.workspace.root, 'pkg-restart'), {
+      name: 'dsh-scaffold-restart',
+      version: '0.2.0',
+      scaffold: { schemaVersion: 1, title: 'Restart', templates: [] },
+    });
+    fake.installBundleOutcome((installed) => ({ ...installed, application: 'restart-required' }));
+    const restarted = await write(operations, { action: 'import', path: restartedDir });
+    assert.equal(restarted.installOutcome, 'restart-required');
+    assert.equal(restarted.nativeEnabled, false, 'it lands installed but not enabled');
+    assert.equal(fake.bundles.has('dsh-scaffold-restart'), true, 'a deferred activation still installed the bundle');
+    assert.equal(fake.bundles.get('dsh-scaffold-restart').enabled, false);
+    const restartedRecord = await packageRecord(operations, restarted.packageKey);
+    assert.equal(restartedRecord.archiveSha256, restarted.archiveSha256);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F08: retrying the same import after a failed install succeeds', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const packageDir = await notesPackage(fake.workspace.root);
+    const operationId = newId();
+    const revisionBefore = operations.store.revision;
+
+    fake.installBundleOutcome({ application: 'failed', error: { message: 'transient' } });
+    await assert.rejects(
+      operations.execute({ action: 'import', operationId, expectedRevision: revisionBefore, path: packageDir }),
+      (error) => error.code === CODES.nativeOperationFailed,
+    );
+
+    // The identical request again, with the native manager now succeeding: it
+    // runs as a first import rather than replaying a recorded outcome, since the
+    // failure left no operation log entry behind.
+    const retried = await operations.execute({
+      action: 'import',
+      operationId,
+      expectedRevision: revisionBefore,
+      path: packageDir,
+    });
+    assert.equal(retried.packageKey, 'dsh-scaffold-notes@0.1.0');
+    assert.equal(retried.installOutcome, 'applied');
+    assert.equal(retried.nativeEnabled, false);
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, false);
+    assert.notEqual(await packageRecord(operations, retried.packageKey), undefined, 'the retry is recorded');
+    assert.equal(operations.store.revision, revisionBefore + 1, 'only the successful attempt wrote state');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('F08: a failed install does not leave its progress step running', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const packageDir = await notesPackage(fake.workspace.root);
+    const operationId = newId();
+    fake.installBundleOutcome({ application: 'failed', error: { message: 'refused' } });
+    await assert.rejects(
+      operations.execute({
+        action: 'import',
+        operationId,
+        expectedRevision: operations.store.revision,
+        path: packageDir,
+      }),
+      (error) => error.code === CODES.nativeOperationFailed,
+    );
+
+    const { operation } = await operations.execute({ action: 'progress', operationId });
+    assert.equal(operation.status, 'failed');
+    assert.equal(operation.error.code, CODES.nativeOperationFailed);
+    const install = operation.steps.find((step) => step.label === 'install without enabling');
+    assert.equal(install.status, 'failed', 'the step that failed is reported as failed, not left active');
+    assert.equal(
+      operation.steps.some((step) => step.status === 'active' || step.status === 'pending'),
+      false,
+      'no step may be left running after the failure',
+    );
   } finally {
     await fake.cleanup();
   }

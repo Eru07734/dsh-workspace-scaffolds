@@ -95,6 +95,7 @@ window.__ModuleLoader__.load({
       confirmDelete: '删除本地归档后，若插件也被卸载，将无法离线恢复。确认删除？',
       resultOk: '操作已完成',
       resultCode: '失败原因',
+      loadFailed: '读取面板状态失败',
       pendingIdle: '有任务在执行，休眠已排队，空闲后自动完成。',
       restartRequired: '原生插件管理器要求重启 DSH 后才会生效。',
       noPackages: '本地仓库为空。',
@@ -190,6 +191,7 @@ window.__ModuleLoader__.load({
       confirmDelete: 'After deleting a local snapshot, a removed plugin can no longer be restored offline. Delete it?',
       resultOk: 'Operation completed',
       resultCode: 'Failure code',
+      loadFailed: 'Could not read the panel state',
       pendingIdle: 'Work is running, so the shelf is queued and will complete when the environment goes idle.',
       restartRequired: 'The native plugin manager needs a DSH restart before this takes effect.',
       noPackages: 'The local warehouse is empty.',
@@ -270,7 +272,14 @@ window.__ModuleLoader__.load({
     /** @param {object} t @returns {object} */
     function usePanel(t) {
       const [state, setState] = React.useState(null);
+      // Two error channels, deliberately not one slot. `error` says why the
+      // user's last action failed; `loadError` says why the snapshot could not
+      // be read. Sharing one slot made the refresh that follows a failed action
+      // erase its reason, so a blocked template-apply looked like nothing
+      // happened. Keeping them apart means a refresh neither clears the action's
+      // failure nor hides its own.
       const [error, setError] = React.useState(null);
+      const [loadError, setLoadError] = React.useState(null);
       const [notice, setNotice] = React.useState(null);
       const [busy, setBusy] = React.useState(false);
       const [selected, setSelected] = React.useState('');
@@ -281,14 +290,16 @@ window.__ModuleLoader__.load({
       const [progress, setProgress] = React.useState(null);
       const [registerPath, setRegisterPath] = React.useState('');
 
+      // Reading the snapshot only ever touches the load channel: a successful
+      // refresh clears a stale load failure and leaves an action failure alone.
       const refresh = React.useCallback(async () => {
         try {
           const value = await request('/state');
           setState(value);
-          setError(null);
+          setLoadError(null);
           return value;
         } catch (failure) {
-          setError({ code: failure.code || 'operation-failed', details: failure.details || {} });
+          setLoadError({ code: failure.code || 'load-failed', details: failure.details || {} });
           return null;
         }
       }, []);
@@ -324,6 +335,8 @@ window.__ModuleLoader__.load({
         async (body, { confirm: needsConfirm } = {}) => {
           if (needsConfirm !== undefined && !window.confirm(needsConfirm)) return null;
           setBusy(true);
+          // Starting a new action retires the previous action's failure; only a
+          // new action clears that channel, never a refresh.
           setError(null);
           setNotice(null);
           setProgress(null);
@@ -336,6 +349,9 @@ window.__ModuleLoader__.load({
               ...body,
             });
             setNotice(value);
+            setError(null);
+            // Re-read after the action, but never let that read report on the
+            // action: a refresh failure is its own, separately shown, failure.
             await refresh();
             return value;
           } catch (failure) {
@@ -349,7 +365,7 @@ window.__ModuleLoader__.load({
         [state, refresh],
       );
 
-      return { state, error, notice, busy, selected, setSelected, packageKey, setPackageKey, importPath, setImportPath, preview, setPreview, values, setValues, progress, registerPath, setRegisterPath, refresh, run, t };
+      return { state, error, loadError, notice, busy, selected, setSelected, packageKey, setPackageKey, importPath, setImportPath, preview, setPreview, values, setValues, progress, registerPath, setRegisterPath, refresh, run, t };
     }
 
     /** The glyph for one step state, paired with a label for screen readers. */
@@ -408,9 +424,10 @@ window.__ModuleLoader__.load({
     /** @param {object} props */
     function Page({ t }) {
       const panel = usePanel(t);
-      const { state, error, notice, busy } = panel;
+      const { state, error, loadError, notice, busy } = panel;
       if (state === null) {
-        return h('div', { className: 'wsc' }, h('style', null, css), h('p', { role: 'status' }, error ? `${t('resultCode')}: ${error.code}` : t('loading')));
+        const failed = error ?? loadError;
+        return h('div', { className: 'wsc' }, h('style', null, css), h('p', { role: 'status' }, failed ? `${t('resultCode')}: ${failed.code}` : t('loading')));
       }
 
       const workspaces = state.workspaces ?? [];
@@ -479,7 +496,7 @@ window.__ModuleLoader__.load({
 
         BindingsSection(panel, current, packages, selectedKey, t),
         PackagesSection(panel, packages, t),
-        ResultSection(error, notice, t),
+        ResultSection(error, loadError, notice, t),
       );
     }
 
@@ -767,18 +784,31 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** @param {object|null} error @param {any} notice @param {object} t */
-    function ResultSection(error, notice, t) {
-      if (error === null && notice === null) return null;
+    /**
+     * The last action's outcome.
+     *
+     * Both failure channels are shown at once when both are set, the action's
+     * own failure first because it is what the user just asked for. Only the
+     * action channel suppresses the success notice: a read that failed after the
+     * action succeeded must not retract the news that the action took effect.
+     * @param {object|null} error
+     * @param {object|null} loadError
+     * @param {any} notice
+     * @param {object} t
+     */
+    function ResultSection(error, loadError, notice, t) {
+      if (error === null && loadError === null && notice === null) return null;
       return h('section', null,
         h('h3', null, t('sectionResult')),
-        error !== null ? h('p', { className: 'wsc-error', role: 'alert' }, `${t('resultCode')}: ${error.code}`) : null,
+        error === null ? null : h('p', { className: 'wsc-error', role: 'alert', 'data-error-source': 'operation' }, `${t('resultCode')}: ${error.code}`),
+        error === null ? null : h('pre', null, JSON.stringify(error.details, null, 2)),
+        loadError === null ? null : h('p', { className: 'wsc-error', role: 'alert', 'data-error-source': 'load' }, `${t('loadFailed')}: ${loadError.code}`),
+        loadError === null ? null : h('pre', null, JSON.stringify(loadError.details, null, 2)),
         error === null && notice?.status === 'pending-idle' ? h('p', { className: 'wsc-hint' }, t('pendingIdle')) : null,
         error === null && notice?.restartRequired ? h('p', { className: 'wsc-error' }, t('restartRequired')) : null,
         error === null && notice !== null && notice.status !== 'pending-idle' && !notice.restartRequired
           ? h('p', { className: 'wsc-ok' }, t('resultOk'))
           : null,
-        error !== null ? h('pre', null, JSON.stringify(error.details, null, 2)) : null,
         error === null && notice !== null ? h('pre', null, JSON.stringify(notice, null, 2)) : null,
       );
     }

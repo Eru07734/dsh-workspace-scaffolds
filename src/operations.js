@@ -804,8 +804,33 @@ export class Operations {
           requestId: request.operationId,
         }),
       );
-      installOutcome = typeof result?.application === 'string' ? result.application : 'installed';
-      report?.complete('install without enabling', { detail: installOutcome });
+      const application = typeof result?.application === 'string' ? result.application : 'installed';
+      report?.complete('install without enabling', {
+        status: application === 'failed' || application === 'cancelled' ? 'failed' : 'done',
+        detail: application,
+      });
+      // `failed` and `cancelled` mean the install did not happen at all: the
+      // package is in neither the profile's dependencies nor its node_modules.
+      // Recording it as imported would make every later "this package is
+      // imported" judgement rest on a false premise and hide the failure from
+      // the user, so refuse here - before `store.mutate`, exactly as
+      // `#enableForWorkspace` does for a refused enable. State and revision stay
+      // untouched, so a retry is a clean first attempt.
+      //
+      // The archive staged above is deliberately *kept* in the warehouse: it is
+      // content-addressed and referenced by nothing yet, so the retry installs
+      // from those exact bytes instead of re-packing and re-hashing the source,
+      // and an archive left behind by a retry that also fails is inert.
+      if (application === 'failed' || application === 'cancelled') {
+        throw new Fault(CODES.nativeOperationFailed, {
+          packageName: imported.name,
+          version: imported.version,
+          application,
+          error: jsonSafe(result?.error ?? null),
+          diagnostic: jsonSafe(result?.diagnostic ?? null),
+        });
+      }
+      installOutcome = application;
     } else if (before.status === 'mismatch') {
       throw new Fault(CODES.versionConflict, {
         packageName: imported.name,
