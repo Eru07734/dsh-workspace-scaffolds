@@ -1,0 +1,42 @@
+{
+  "name": "dsh-workspace-scaffolds",
+  "version": "0.1.0",
+  "description": "把 DSH 工程与工程使用的脚手架插件关联起来：开工前准备、工作中追加、不用时休眠保留到磁盘、再次使用时随工程恢复。",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./plugin.js",
+    "./host": "./plugin.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "plugin.js",
+    "index.js",
+    "src",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Release artifacts are built, not committed
+*.tgz
+.pack-staging/
+
+# Plugin runtime state (never part of the source tree)
+workspace-scaffolds/
+state.json
+state.json.bak
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

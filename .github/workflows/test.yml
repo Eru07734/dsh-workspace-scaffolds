@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run the test suite
+        run: node --test test/*.test.mjs
+      - name: Build the release tarball
+        run: node scripts/pack.mjs .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-workspace-scaffolds-tgz-node${{ matrix.node }}
+          path: dsh-workspace-scaffolds-*.tgz
+          if-no-files-found: error

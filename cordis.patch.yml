@@ -1,0 +1,4 @@
+- insert:
+    - id: workspace-scaffolds
+      name: dsh-workspace-scaffolds
+      config: {}

@@ -1,0 +1,4 @@
+- insert:
+    - id: scaffold-notes
+      name: dsh-scaffold-notes
+      config: {}

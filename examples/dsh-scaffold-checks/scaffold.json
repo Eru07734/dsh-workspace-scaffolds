@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "title": "工程自检",
+  "requires": [],
+  "variables": {
+    "projectName": {
+      "type": "string",
+      "required": true,
+      "maxLength": 100,
+      "description": "工程显示名称，写入清单标题。"
+    }
+  },
+  "templates": [
+    {
+      "id": "checks",
+      "title": "自检清单",
+      "files": [
+        { "source": "templates/CHECKS.md", "target": "docs/CHECKS.md", "render": "text" }
+      ]
+    }
+  ]
+}

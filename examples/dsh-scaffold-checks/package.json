@@ -1,0 +1,12 @@
+{
+  "name": "dsh-scaffold-checks",
+  "version": "0.1.0",
+  "description": "工程自检脚手架：提供 project_checklist 工具，并生成自检清单模板。",
+  "type": "module",
+  "license": "MIT",
+  "exports": { ".": "./plugin.js" },
+  "files": ["plugin.js", "cordis.patch.yml", "scaffold.json", "templates", "README.md"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "workspaceScaffold": "./scaffold.json",
+  "engines": { "node": ">=22" }
+}

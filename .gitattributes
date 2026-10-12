@@ -1,0 +1,11 @@
+# Normalize line endings so the plugin and its templates behave the same on
+# every platform. Text files are stored with LF in the repository.
+* text=auto eol=lf
+
+# Binary fixtures must never be converted.
+*.tgz binary
+*.png binary
+*.ico binary
+
+# Keep diffs readable for generated or vendored text.
+pnpm-lock.yaml -diff

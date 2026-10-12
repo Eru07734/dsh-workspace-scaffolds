@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "title": "工程笔记",
+  "requires": [],
+  "variables": {
+    "projectName": {
+      "type": "string",
+      "required": true,
+      "maxLength": 100,
+      "description": "工程显示名称，写入模板标题。"
+    },
+    "owner": {
+      "type": "string",
+      "required": false,
+      "default": "",
+      "maxLength": 100,
+      "description": "负责人；留空则保持占位。"
+    }
+  },
+  "templates": [
+    {
+      "id": "notes",
+      "title": "工程笔记与决策记录",
+      "files": [
+        { "source": "templates/PROJECT-NOTES.md", "target": "docs/PROJECT-NOTES.md", "render": "text" },
+        { "source": "templates/DECISIONS.md", "target": "docs/DECISIONS.md", "render": "text" }
+      ]
+    }
+  ]
+}
