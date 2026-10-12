@@ -135,11 +135,11 @@ test('a generated operationId makes each tool call independent', async () => {
       scaffold: { schemaVersion: 1, templates: [] },
     });
     const first = await tool.execute({ action: 'import', path: packageDir, expectedRevision: 0 }, execIn(projectDir));
-    assert.equal(first.ok, true);
+    assert.equal(first.ok, true, `first import failed: ${first.code} ${JSON.stringify(first.details)}`);
     // Same arguments, no explicit operationId: this is a second, independent
     // call, so it must succeed against the new revision rather than replay.
     const second = await tool.execute({ action: 'import', path: packageDir, expectedRevision: 1 }, execIn(projectDir));
-    assert.equal(second.ok, true);
+    assert.equal(second.ok, true, `second import failed: ${second.code} ${JSON.stringify(second.details)}`);
   } finally {
     await fake.cleanup();
   }

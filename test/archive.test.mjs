@@ -6,12 +6,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { gzipSync } from 'node:zlib';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { extractTarball, inspectTarball, packDirectory } from '../src/tar.js';
 import { CODES } from '../src/errors.js';
-import { pathInside, resolveInside } from '../src/util.js';
+import { pathInside, resolveInside, sha256Hex } from '../src/util.js';
+
+/**
+ * Read one octal header field from a raw tar buffer.
+ * @param {Buffer} tar @param {number} offset @param {number} length
+ * @returns {number}
+ */
+function readOctal(tar, offset, length) {
+  const text = tar.toString('latin1', offset, offset + length).replace(/\0.*$/, '').trim();
+  return text === '' ? 0 : Number.parseInt(text, 8);
+}
 
 /**
  * Build one USTAR entry block.
@@ -70,6 +80,39 @@ test('packDirectory skips node_modules and .git', async () => {
     const packed = await packDirectory(dir);
     const paths = inspectTarball(packed.buffer).entries.map((entry_) => entry_.path);
     assert.deepEqual(paths, ['package', 'package/package.json']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('packing embeds no wall-clock time, so an unchanged directory always hashes the same', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'wss-tar-'));
+  try {
+    await mkdir(join(dir, 'templates'), { recursive: true });
+    await writeFile(join(dir, 'package.json'), '{"name":"x","version":"1.0.0"}');
+    await writeFile(join(dir, 'templates', 'a.txt'), 'hello');
+
+    // Pin the directory to a known past instant. A pack that reached for the
+    // current time would embed roughly "now" here and fail this assertion
+    // deterministically, rather than only when a test happened to straddle a
+    // second boundary.
+    const past = new Date('2001-02-03T04:05:06Z');
+    await utimes(dir, past, past);
+
+    const first = await packDirectory(dir);
+    const second = await packDirectory(dir);
+    assert.equal(
+      sha256Hex(first.buffer),
+      sha256Hex(second.buffer),
+      'packing the same unchanged directory twice must produce identical bytes',
+    );
+
+    const { tarBuffer } = inspectTarball(first.buffer);
+    assert.equal(
+      readOctal(tarBuffer, 136, 12),
+      Math.floor(past.getTime() / 1000),
+      'the synthetic package/ entry must carry the source directory timestamp, not the pack time',
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -126,8 +126,20 @@ export async function packDirectory(directory) {
   }
   const chunks = [];
   let total = 0;
+  // The synthetic `package/` entry takes its timestamp from the packed
+  // directory, never from the clock. Reading the clock here would make the
+  // archive hash depend on *when* the pack ran, so packing one unchanged
+  // directory across a second boundary would produce two different hashes and
+  // a legitimate re-import would be rejected as a content conflict.
+  const rootInfo = await stat(directory);
   chunks.push(
-    header({ ...splitName(`${PACK_PREFIX}/`), size: 0, mode: 0o755, mtime: Math.floor(Date.now() / 1000), type: '5' }),
+    header({
+      ...splitName(`${PACK_PREFIX}/`),
+      size: 0,
+      mode: 0o755,
+      mtime: Math.floor(rootInfo.mtimeMs / 1000),
+      type: '5',
+    }),
   );
   for (const entry of collected) {
     if (entry.kind === 'directory') {
