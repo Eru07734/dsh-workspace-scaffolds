@@ -131,6 +131,11 @@ export function registerTool(ctx, operations) {
 function summarizeList(snapshot) {
   return {
     revision: snapshot.revision,
+    // Which build is answering, and what the profile asks for. These disagree
+    // while a package update sits on disk but the process still holds old code.
+    pluginVersion: snapshot.pluginVersion,
+    profileSpec: snapshot.profileSpec,
+    restartPending: snapshot.restartPending,
     automaticRestore: snapshot.automaticRestore,
     runningAgents: snapshot.runningAgents,
     pendingSleeps: snapshot.pendingSleeps,

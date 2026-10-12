@@ -15,6 +15,7 @@ import { readScaffoldDescriptor, summarizeDescriptor } from './scaffold.js';
 import { readBindRequest } from './schema.js';
 import { applyPreview, buildPreview, resolveVariables, selectTemplate } from './templates.js';
 import { jsonSafe } from './store.js';
+import { ownIdentity, restartPending } from './version.js';
 import {
   canonicalize,
   newId,
@@ -106,6 +107,27 @@ export class Operations {
       if (samePath(candidate, resolved)) return workspace.workspaceId;
     }
     return null;
+  }
+
+  /**
+   * The dependency spec the profile manifest declares for this plugin.
+   *
+   * Diagnostic only: this is what the profile *asks* for, which is not
+   * necessarily what is running. Any failure yields `null` rather than a guess,
+   * because a guessed spec would silently defeat the comparison it exists for.
+   * @param {string|null} packageName
+   * @returns {Promise<string|null>}
+   */
+  async #profileSpec(packageName) {
+    if (typeof packageName !== 'string' || packageName.length === 0) return null;
+    if (typeof this.host.profileDir !== 'string' || this.host.profileDir.length === 0) return null;
+    try {
+      const manifest = JSON.parse(await readFile(join(this.host.profileDir, 'package.json'), 'utf8'));
+      const spec = manifest?.dependencies?.[packageName];
+      return typeof spec === 'string' ? spec : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -269,8 +291,18 @@ export class Operations {
       .filter((workspace) => state.workspaces[workspace.workspaceId] === undefined)
       .map((workspace) => ({ workspaceId: workspace.workspaceId, title: workspace.title, path: workspace.path }));
 
+    const identity = ownIdentity();
+    const profileSpec = await this.#profileSpec(identity.name);
+
     return {
       revision: state.revision,
+      // The running build's own identity, so a caller can tell which code is
+      // answering without probing behaviour. `profileSpec` is what the profile
+      // asks for; when the two disagree the process is holding older code.
+      pluginName: identity.name,
+      pluginVersion: identity.version,
+      profileSpec,
+      restartPending: restartPending(identity.version, profileSpec),
       profileName: this.host.profileName,
       profileDir: this.host.profileDir,
       automaticRestore: this.automaticRestore,

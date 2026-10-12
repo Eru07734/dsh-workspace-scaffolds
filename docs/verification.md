@@ -66,6 +66,16 @@ GET /api/workspace-scaffolds/state -> HTTP 200
 
 同时删除了九个写动作内部重复的重放检查（已不可达）。
 
+### 诊断缺口 3：无法回答「现在跑的是哪个构建」
+
+**现象**：更新到 0.1.3 后，`installBundle` 返回 `application: "restart-required"`（已实测，与源码中 `Object.hasOwn(before, name)` 分支一致），说明磁盘是 0.1.3、内存仍是 0.1.2。但**没有任何接口能直接确认这一点**——只能拿缺陷 2 的行为当探针：发一个过期 revision 的请求，200 说明还是旧代码，409 说明已是新的。
+
+**为什么是问题**：用一个已知缺陷去探测版本，意味着一旦缺陷修好，探测手段也随之失效；而且它只能回答「是不是那一版」，不能回答「到底是哪一版」。
+
+**修复**：`list` 与 `GET /state` 增加 `pluginVersion`（读自**运行中模块自身**的 `package.json`，而非 profile 声明）、`profileSpec`（profile 声明的 spec）与 `restartPending`。面板标题行显示版本，并在两者不一致时给出重启提示。
+
+**边界**：`restartPending` 只对 `file:` / `link:` 这类把具体产物写进字符串的本地 spec 判定；注册表范围（`^0.1.0`）描述的是可接受集合而非另一个构建，永不报告为待重启。版本读不到时返回 `false`，不把「未知」伪装成结论。
+
 **回归测试**（`test/operations.test.mjs`）：三项，分别锁定「过期 revision 即使会 no-op 也必须拒绝」「`wake` 的过期 revision 报冲突而不是找不到工作区」「重放仍优先于 revision 校验」。修复前的行为就是实测到的 200。
 
 ## 运行方式
@@ -112,8 +122,8 @@ node --test test/*.test.mjs
 ## 当前结果
 
 ```
-ℹ tests 75
-ℹ pass 75
+ℹ tests 83
+ℹ pass 83
 ℹ fail 0
 ```
 

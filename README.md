@@ -58,7 +58,7 @@
 # 在 DSH 中通过插件管理器安装本目录或发行包
 dsh plugin add /absolute/path/to/dsh-workspace-scaffolds
 # 或安装打包好的发行包
-dsh plugin add ./dsh-workspace-scaffolds-0.1.3.tgz
+dsh plugin add ./dsh-workspace-scaffolds-0.1.4.tgz
 ```
 
 安装后需要为本插件启用 bundle（默认 `cordis.patch.yml` 已声明）。面板出现在 **插件页 → 本插件卡片**，使用 `plugins.bundle.config` 插槽。
@@ -110,6 +110,8 @@ dsh plugin add ./dsh-workspace-scaffolds-0.1.3.tgz
 
 所有写操作都携带当前 `revision`；版本冲突时面板会重新读取状态并提示，不会盲目重放。
 
+面板标题行显示三个标签：`配置版本`、profile 名称、以及**当前运行的构建版本**（`pluginVersion`）。当 profile 声明的构建与内存中运行的不是同一个时，面板会额外显示一行提示和所声明的 spec —— 也就是「更新已写盘，但需要重启才生效」这个状态，不必再靠行为反推。
+
 ## agent 工具
 
 工具名 `workspace_scaffolds`，动作与 HTTP 接口一致。默认工程取自当前会话的工作目录（通过原生工程注册表按规范化路径精确匹配，不做前缀猜测）。
@@ -141,6 +143,20 @@ POST /api/workspace-scaffolds/execute
 成功：`{ "ok": true, "value": ... }`；失败：`{ "ok": false, "code": "...", "details": { ... } }`。
 
 请求体上限 1 MiB。配置、版本、模板冲突返回 409，输入错误 400，找不到 404。
+
+### 构建标识
+
+`list`（以及 `GET /state`）的返回值里带有三个诊断字段，用来回答「现在到底是哪个构建在跑」：
+
+| 字段 | 含义 |
+|---|---|
+| `pluginVersion` | **正在内存中运行的**构建版本，读自该模块自己的 `package.json` |
+| `profileSpec` | profile manifest 为该插件声明的依赖 spec（即「请求的是哪个」），读不到时为 `null` |
+| `restartPending` | 前者与后者不一致，需要重启 DSH 才会生效 |
+
+`pluginVersion` 取自**运行中的模块自身**，而不是 profile 声明——后者恰恰是会在「更新已写盘、进程仍持旧代码」时说谎的那个。
+
+`restartPending` 是**保守启发式**：只对 `file:` / `link:` 这类把具体产物写进字符串的本地 spec 判定；`^0.1.0` 这类注册表范围描述的是一个可接受集合，不是另一个构建，因此永不报告为待重启。读不到版本时一律返回 `false`，不会把「未知」伪装成任何结论。
 
 ### 错误码
 
@@ -195,7 +211,7 @@ node --test test/*.test.mjs
 
 | 验证了什么 | 没验证什么 |
 |---|---|
-| 75 项 `node:test` 用例全部通过 | 完整工作流在真实工程上跑通 |
+| 83 项 `node:test` 用例全部通过 | 完整工作流在真实工程上跑通 |
 | Linux（Node 22 / 24）与 Windows 上均通过 | 浏览器面板的真实渲染与交互 |
 | 真实 `src/host.js` 适配层被实际执行（非桩替换） | 重启后的状态对账 |
 | **已在真实 DSH 中热载入并响应接口**（见 docs/verification.md） | 与具体 DSH 版本升级后的兼容性 |

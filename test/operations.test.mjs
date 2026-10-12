@@ -411,6 +411,41 @@ test('A22: a sleeping workspace restores its association after a restart', async
   }
 });
 
+test('list reports the running build and the profile-declared spec', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+
+    // With no profile manifest at hand the spec is reported as unknown rather
+    // than guessed, and nothing claims a restart.
+    const bare = await operations.execute({ action: 'list' });
+    assert.equal(bare.pluginVersion, manifest.version);
+    assert.equal(bare.pluginName, manifest.name);
+    assert.equal(bare.profileSpec, null);
+    assert.equal(bare.restartPending, false);
+
+    // Now let the profile declare a different local build, which is exactly the
+    // state after an update is written but before the process restarts.
+    await writeFile(
+      join(fake.host.profileDir, 'package.json'),
+      JSON.stringify({ name: 'desktop', dependencies: { [manifest.name]: 'file:/elsewhere/dsh-workspace-scaffolds-9.9.9.tgz' } }),
+    );
+    const pending = await operations.execute({ action: 'list' });
+    assert.equal(pending.profileSpec, 'file:/elsewhere/dsh-workspace-scaffolds-9.9.9.tgz');
+    assert.equal(pending.restartPending, true, 'a different local build on disk must be reported');
+
+    // Declaring the running build is not a pending restart.
+    await writeFile(
+      join(fake.host.profileDir, 'package.json'),
+      JSON.stringify({ name: 'desktop', dependencies: { [manifest.name]: `file:/elsewhere/dsh-workspace-scaffolds-${manifest.version}.tgz` } }),
+    );
+    const current = await operations.execute({ action: 'list' });
+    assert.equal(current.restartPending, false);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('a stale revision is refused even when the action would have been a no-op', async () => {
   const { fake, operations } = await setup();
   try {

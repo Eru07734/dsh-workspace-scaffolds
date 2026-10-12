@@ -14,6 +14,10 @@ window.__ModuleLoader__.load({
       loading: '正在读取…',
       refresh: '刷新',
       revision: '配置版本',
+      version: '版本',
+      versionUnknown: '未知',
+      profileSpec: 'profile 声明',
+      restartPending: 'profile 请求的版本与内存中运行的构建不同，需要重启 DSH 才能生效。',
       capabilityMissing: '原生插件管理器不可用，只能查看已保存的关联。',
       workspaceMissing: '原生工程注册表不可用，请确认 DSH 版本。',
       runningAgents: '有任务正在执行；休眠会推迟到空闲时执行。',
@@ -94,6 +98,10 @@ window.__ModuleLoader__.load({
       loading: 'Loading…',
       refresh: 'Refresh',
       revision: 'Revision',
+      version: 'Version',
+      versionUnknown: 'unknown',
+      profileSpec: 'profile declares',
+      restartPending: 'The profile asks for a different build than the one running; restart DSH to apply it.',
       capabilityMissing: 'The native plugin manager is unavailable; saved associations are read-only.',
       workspaceMissing: 'The native workspace registry is unavailable. Check the DSH version.',
       runningAgents: 'Work is running; a shelf is deferred until the environment is idle.',
@@ -303,8 +311,20 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', onClick: () => void panel.refresh(), disabled: busy }, t('refresh')),
           h('span', { className: 'wsc-tag' }, `${t('revision')} ${state.revision}`),
           h('span', { className: 'wsc-tag' }, state.profileName ?? ''),
+          // Which build is answering. Shown next to the profile's declared spec
+          // so "an update is on disk but the process still holds old code" is
+          // visible instead of having to be inferred from behaviour.
+          h('span', { className: 'wsc-tag', 'data-plugin-version': state.pluginVersion ?? '' },
+            `${t('version')} ${state.pluginVersion ?? t('versionUnknown')}`),
         ),
         h('p', { className: 'wsc-hint' }, t('intro')),
+        state.restartPending
+          ? h('p', { className: 'wsc-error', 'data-restart-pending': 'true' },
+              `${t('restartPending')} ${t('profileSpec')}: ${state.profileSpec}`)
+          : null,
+        state.pluginVersion === null && state.profileSpec !== null
+          ? h('p', { className: 'wsc-hint' }, `${t('profileSpec')}: ${state.profileSpec}`)
+          : null,
         state.capabilities?.pluginManager !== true ? h('p', { className: 'wsc-error' }, t('capabilityMissing')) : null,
         state.capabilities?.workspaceRegistry !== true ? h('p', { className: 'wsc-error' }, t('workspaceMissing')) : null,
         state.recoveryNote ? h('p', { className: 'wsc-error' }, t('recovery')) : null,

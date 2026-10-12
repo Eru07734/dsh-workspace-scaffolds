@@ -217,6 +217,32 @@ test('the panel renders the loading branch before the snapshot arrives', async (
   assert.match(texts(tree).join(' | '), /loading/);
 });
 
+test('the panel shows which build is running and warns when a restart is pending', async () => {
+  const { fake, snapshot } = await realSnapshot();
+  try {
+    const current = await renderPanel([snapshot, null, null, false, '', '', '', null, {}]);
+    const rendered = texts(current).join(' | ');
+    assert.match(rendered, new RegExp(`version ${snapshot.pluginVersion.replace(/\./g, '\\.')}`));
+
+    const stale = await renderPanel([
+      { ...snapshot, profileSpec: 'file:/elsewhere/dsh-workspace-scaffolds-9.9.9.tgz', restartPending: true },
+      null,
+      null,
+      false,
+      '',
+      '',
+      '',
+      null,
+      {},
+    ]);
+    const staleText = texts(stale).join(' | ');
+    assert.match(staleText, /restartPending/, 'a pending restart must be surfaced');
+    assert.match(staleText, /9\.9\.9/, 'the declared spec must be shown');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('the panel surfaces a failure code and the busy state disables actions', async () => {
   const { fake, snapshot } = await realSnapshot();
   try {
