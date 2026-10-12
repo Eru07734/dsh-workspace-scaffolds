@@ -12,7 +12,15 @@ import { registerTool, TOOL_NAME } from '../src/tool.js';
 import { CODES } from '../src/errors.js';
 import { createFakeHost, writeScaffoldPackage } from './helpers/fake-host.mjs';
 
-/** Register the tool on a capturing context. @param {Operations} operations */
+/**
+ * Register the tool the way the host does.
+ *
+ * The host hands the tool the same narrow facade the HTTP surface receives, not
+ * the `Operations` instance. Injecting the instance here instead is what let a
+ * missing `workspaceIdForPath` on the facade ship: every test passed while the
+ * real tool failed on any call that relied on the session's own workspace.
+ * @param {Operations} operations
+ */
 function capture(operations) {
   let definition = null;
   const ctx = {
@@ -22,7 +30,11 @@ function capture(operations) {
       },
     },
   };
-  registerTool(ctx, operations);
+  registerTool(ctx, {
+    execute: (request) => operations.execute(request),
+    workspaceIdForPath: (cwd) => operations.workspaceIdForPath(cwd),
+    reconcileFromEvent: () => operations.reconcileFromEvent(),
+  });
   assert.ok(definition !== null);
   return definition;
 }

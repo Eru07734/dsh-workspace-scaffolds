@@ -247,6 +247,42 @@ export class Store {
     return this.peek().operations[operationId] ?? null;
   }
 
+  /**
+   * Remember the native enablement state this plugin last applied for a package.
+   *
+   * Written outside the caller's operation because it has to survive a restart:
+   * a later reconciliation needs it to tell a bundle this plugin turned on and
+   * has not released from one somebody else turned on. It cannot be folded into
+   * the caller's mutate, because the native write happens before that mutate
+   * commits.
+   *
+   * A no-op when the value is unchanged, so ordinary operation counts are not
+   * inflated by writes that carry no information.
+   *
+   * The revision is deliberately *not* bumped, exactly as for preview records:
+   * this is bookkeeping about what the native side was observed to be, not a
+   * configuration change a caller guards with `expectedRevision`. Bumping it
+   * would invalidate the revision of the very operation performing the native
+   * write, since that write happens before the caller's own mutation commits.
+   * The state lock still serializes this against every other writer.
+   * @param {string} key Package key `name@version`.
+   * @param {boolean} enabled The state just applied.
+   * @returns {Promise<boolean>} Whether the stored record changed.
+   */
+  async recordApplied(key, enabled) {
+    return await withKeyLock(`state:${this.directory}`, async () => {
+      const draft = clone(this.state);
+      const record = draft.packages[key];
+      if (record === undefined) return false;
+      if (record.lastAppliedEnabled === enabled) return false;
+      record.lastAppliedEnabled = enabled;
+      const normalized = normalizeState(draft);
+      await writeJsonAtomic(this.statePath, normalized);
+      this.state = normalized;
+      return true;
+    });
+  }
+
   /** @param {object} value @returns {any} A JSON round-trip copy safe to persist and return. */
   static jsonSafe(value) {
     return jsonSafe(value);

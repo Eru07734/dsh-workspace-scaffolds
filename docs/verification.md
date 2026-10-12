@@ -122,8 +122,8 @@ node --test test/*.test.mjs
 ## 当前结果
 
 ```
-ℹ tests 85
-ℹ pass 85
+ℹ tests 88
+ℹ pass 88
 ℹ fail 0
 ```
 
@@ -144,6 +144,37 @@ node --test test/*.test.mjs
 | 延迟休眠 | 有 agent 在跑时返回 `pending-idle` 并排队，bundle 保持 enabled，`ready=false` |
 
 **这一步立刻抓出了缺陷 4**（见下）。两个示例包的预览与应用路径是正确的；缺陷出在恢复（启用）环节。
+
+### 重启后复验（0.1.5）
+
+重启后确认 0.1.5 已载入，并复验缺陷 4 的修复在真实环境生效：
+
+```
+pluginVersion  : 0.1.5
+profileSpec    : file:C:/Users/jyj20/DSH 插件/.../dsh-workspace-scaffolds-0.1.5.tgz
+restartPending : false
+
+wake -> applied: [already-enabled, already-enabled]  failures: []  ready: true
+   dsh-scaffold-notes   native=enabled  pinned=false  heldBy=1
+   dsh-scaffold-checks  native=enabled  pinned=false  heldBy=1
+```
+
+修复前完全相同的序列必然把两个包钉死（12:57:21 与 13:04:22 两条 `reconcile` 日志即证据）。**这是缺陷 4 修复的真实验证。**
+
+### 能力可用性（关键证据）
+
+启用 `dsh-scaffold-checks` 之后，在**下一次模型请求**中直接调用它注册的工具，成功返回真实数据：
+
+```
+project_checklist(path: "...\dsh-workspace-scaffolds")
+-> { ok: true, present: [README.md, docs, .gitignore, LICENSE, package.json], missing: [] }
+```
+
+这一条同时证明了整条链路：**关联 → 热启用（无重启）→ bundle 注册工具 → 下一次请求即可调用**，即 `effectiveFrom: "next-model-request"` 的字面含义。插件自己的 `workspace_scaffolds` 工具同样可调用，返回完整状态（`pluginVersion=0.1.5`、`pinned=false`、`ready=true`）。
+
+### 一次被推翻的判断（方法教训）
+
+中途我曾判断「重启对账把两个包都钉住了」。核对 revision 后**推翻**：全程正好 12 次写、每次都有日志条目，**重启后没有任何 reconcile 写入**。真实原因是旧进程（0.1.2）在我安装 0.1.5 时收到 `plugin-manager/changed`，被有缺陷的监听器重新钉住。**教训：状态时间线要靠 revision 计数与操作日志交叉核对，不能只看当前字段值就归因。**
 
 ## 缺陷 4：唤醒时把自己刚启用的包误判为「外部启用」并钉住
 
@@ -173,6 +204,44 @@ reconcile  result={"drift":[{"key":"dsh-scaffold-notes@0.1.0",
 **验证**：拆掉第 1 处 → 回归测试失败；拆掉第 2 处（含提交时复查）→ 回归测试失败；只拆外层那一处则仍通过，因为内层复查兜住了，属纵深防御。同时补了一条反向测试：**无人认领的启用仍必须被保护**（不得停用不是自己开的东西），确保修复没有把安全规则一起削掉。
 
 **教训**：`wake` 里「先启用、后提交意图」的顺序本身就把两者之间的窗口暴露给了任何监听器。这类自指事件流（自己的写触发自己的监听器）在假宿主上完全测不出来——测试必须显式模拟「原生为自己的写入发出变更事件」，否则这条路径永远不被覆盖。已把该模拟加进假宿主。
+
+## 缺陷 5：跨重启时无法区分「自己的遗留」与「他人的意图」
+
+**发现方式**：读缺陷 4 的修复时推演出来的，**不是观测到的**。触发路径：`sleep` 返回 `pending-idle` 并把释放排进**内存**队列 → 队列还没执行就重启 → 队列丢失、bundle 仍 `enabled`、工作区已是 `sleeping` → 启动对账无租约可解释 → 按缺陷 4 的新规则被当成外部意图**再次钉死**。
+
+即缺陷 4 的修复解决了进程内竞态，但没解决跨重启的归属：重启后没有任何信息能说明「这个已启用的包是本插件开的」。
+
+**修复**：持久化归属。包记录新增 `lastAppliedEnabled`，在每次本插件执行原生启用/停用后记录（`Store.recordApplied`），导入/关联建立记录时以观察到的状态初始化。`reconcile` 从「一种猜测」改为**四种明确情形**：
+
+| 情形 | 判定 | 动作 |
+|---|---|---|
+| 有租约（活跃工作区认领） | 被解释 | 不报告 |
+| 本插件应用的状态、尚未释放 | 自己的遗留 | `enabled-by-us-unreleased`，**不钉** |
+| 本插件知道自己最后是关的 | 他人的意图 | `enabled-outside-management`，**钉住** |
+| 来源未知（旧版本写入的记录） | 无法判断 | `provenance-unknown`，**既不钉也不释放**，只上报 |
+
+最后一档是关键：**绝不在未知上做决定**。猜成「钉住」会把 bundle 焊死，猜成「释放」会停用本插件从未开启的东西；报告是唯一安全的选择。
+
+**关键实现细节**：`recordApplied` **不递增 revision**（与预览记录一致）。第一版递增了，结果 `wake` 自己的 mutate 立即冲突——10 项测试同时报 `revision-conflict`。归属是诊断元数据，不是调用方用 `expectedRevision` 守护的配置变更；状态锁仍然串行化它与其它写入。
+
+**回归测试**：两条，分别锁定「自己的遗留重启后不被钉、且休眠仍能完成」与「未知来源既不被钉也不被释放」。逐条验证承重：破坏「自己的遗留」分支 → 前者失败；让未知分支去钉 → 后者失败。
+
+## 缺陷 6：agent 工具拿到的门面缺少方法，省略 workspaceId 的调用全部失败
+
+**发现方式**：**用 agent 会用的方式调用工具**时立刻暴露：
+
+```
+{ "ok": false, "code": "native-operation-failed",
+  "details": { "message": "operations.workspaceIdForPath is not a function" } }
+```
+
+`index.js` 通过 `registerTool(ctx, guarded)` 交给工具的是**门面对象**，而门面只导出了 `execute`。于是**凡是省略 `workspaceId`、依赖「当前会话自己的工作区」的调用全部失败**——而这正是工具描述里推荐的默认用法、也是 agent 的主用法，等于工具的人体工学主路径是坏的。
+
+**为什么测试没抓到**：`test/tool.test.mjs` 注入的是**真实的 `Operations` 实例**，而宿主注入的是门面。测试替身与生产接线不一致，典型测试失真——测试全绿，生产挂。
+
+**修复**：门面补齐 `workspaceIdForPath` 与 `reconcileFromEvent`，并注明「工具调用的每个方法都必须在这里列出」。**测试侧**：`tool.test.mjs` 改为走同样的门面形状；并在 `plugin.test.mjs` 新增一条**走真实 `apply()` 接线**的测试——从 `ctx.tools.register` 捕获工具，以省略 `workspaceId` 的调用验证解析结果。已验证：把门面方法去掉，该测试报出**完全相同**的生产错误。
+
+**教训**：测试必须注入**宿主实际注入的那个对象**。用更「完整」的替身会掩盖接口缺口；这类缺陷只有真的调用一次才会出现。
 
 ## CI 发现并已修复的缺陷
 

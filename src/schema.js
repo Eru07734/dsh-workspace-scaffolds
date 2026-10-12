@@ -60,6 +60,12 @@ function normalizePackage(raw, key) {
     initiallyEnabled: raw.initiallyEnabled === true,
     ownership,
     pinned: raw.pinned === true,
+    // The enablement this plugin last applied or observed. `null` means the
+    // provenance is unknown - a record written before this field existed - and
+    // reconcile treats that as "leave it alone and report", never as proof of
+    // either our own leftover or somebody else's intent.
+    lastAppliedEnabled:
+      raw.lastAppliedEnabled === true ? true : raw.lastAppliedEnabled === false ? false : null,
     title: typeof raw.title === 'string' ? raw.title : null,
     importedAt: typeof raw.importedAt === 'string' ? raw.importedAt : nowIso(),
     archiveEntryCount: Number.isInteger(raw.archiveEntryCount) ? raw.archiveEntryCount : null,

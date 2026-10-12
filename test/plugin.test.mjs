@@ -164,6 +164,31 @@ test('an unknown action over HTTP is a 400, not a crash', async () => {
   }
 });
 
+test('the tool mounted by apply resolves the session workspace through its facade', async () => {
+  const fake = await createFakeHost();
+  try {
+    const projectDir = join(fake.workspace.root, 'demo');
+    const workspace = await fake.workspace.add(projectDir, 'demo');
+    const mounted = mount(fake);
+    const tool = mounted.tools.find((definition) => definition.name === TOOL_NAME);
+    assert.ok(tool !== undefined, 'apply must register the agent tool');
+
+    const exec = { agent: { session: { header: { cwd: projectDir } } } };
+    const listed = await tool.execute({ action: 'list' }, exec);
+    assert.equal(listed.ok, true, `list failed: ${listed.code} ${JSON.stringify(listed.details)}`);
+
+    // Omitting workspaceId is the documented default and the path an agent
+    // actually takes, so it has to work through the *real* facade rather than
+    // through a directly injected operations instance. Injecting the instance
+    // is what let a missing facade method ship.
+    const resolved = await tool.execute({ action: 'sleep', expectedRevision: listed.value.revision }, exec);
+    assert.equal(resolved.ok, true, `sleep failed: ${resolved.code} ${JSON.stringify(resolved.details)}`);
+    assert.equal(resolved.resolvedWorkspaceId, workspace.workspaceId);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('the agent/created listener tolerates an agent without a workspace', async () => {
   const fake = await createFakeHost();
   try {

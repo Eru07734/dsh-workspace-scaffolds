@@ -81,6 +81,13 @@ export function apply(ctx) {
 
   // Every entry point waits for the store, so a request that arrives during
   // startup cannot observe a half-loaded state.
+  //
+  // This facade is what the HTTP surface, the agent tool and the `workspaceScaffolds`
+  // service all receive. Every method the tool calls has to be listed here: the
+  // tool briefly received the facade without `workspaceIdForPath` and every call
+  // that relied on the session's own workspace failed with a confusing internal
+  // error, while the tests passed because they injected the operations instance
+  // directly instead of this facade.
   const guarded = {
     /**
      * @param {object} request
@@ -89,6 +96,21 @@ export function apply(ctx) {
     async execute(request) {
       await ensureReady();
       return await operations.execute(request);
+    },
+    /**
+     * @param {string} cwd
+     * @returns {Promise<string|null>}
+     */
+    async workspaceIdForPath(cwd) {
+      await ensureReady();
+      return await operations.workspaceIdForPath(cwd);
+    },
+    /**
+     * @returns {Promise<object|null>}
+     */
+    async reconcileFromEvent() {
+      await ensureReady();
+      return await operations.reconcileFromEvent();
     },
   };
 

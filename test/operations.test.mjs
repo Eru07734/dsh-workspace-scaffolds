@@ -515,6 +515,89 @@ test('a bundle enabled with no workspace claiming it is still treated as externa
   }
 });
 
+test('a bundle this plugin enabled and never released is not pinned after a restart', async () => {
+  const { fake, operations, store } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'one'), 'one');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    await write(operations, { action: 'wake', workspaceId: workspace.workspaceId });
+
+    // Reproduce a restart that dropped a queued shelf: the declared intent is
+    // 'sleeping' while the bundle it asked for is still enabled, and the
+    // in-memory sleep queue is gone.
+    await store.mutate({ action: 'sleep', operationId: newId(), expectedRevision: store.revision }, (draft) => {
+      draft.workspaces[workspace.workspaceId].requestedState = 'sleeping';
+      return {};
+    });
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true);
+
+    const revived = new Store(fake.host.storageDir);
+    await revived.init();
+    const restarted = new Operations({ host: fake.host, store: revived, activity: new Activity(fake.host) });
+    restarted.init();
+
+    const reconciled = await restarted.reconcileFromEvent();
+    const entry = reconciled.drift.find((row) => row.key === 'dsh-scaffold-notes@0.1.0');
+    assert.equal(entry?.change, 'enabled-by-us-unreleased');
+    assert.equal(entry?.action, undefined, 'our own unreleased leftover must never be pinned');
+
+    let snapshot = await restarted.execute({ action: 'list' });
+    assert.equal(snapshot.packages.find((row) => row.key === 'dsh-scaffold-notes@0.1.0').pinned, false);
+
+    // And the shelf can still complete, which is the whole point.
+    const slept = await write(restarted, { action: 'sleep', workspaceId: workspace.workspaceId });
+    assert.deepEqual(slept.release.released, [{ key: 'dsh-scaffold-notes@0.1.0', outcome: 'applied' }]);
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, false);
+    snapshot = await restarted.execute({ action: 'list' });
+    assert.equal(snapshot.packages.find((row) => row.key === 'dsh-scaffold-notes@0.1.0').pinned, false);
+  } finally {
+    await fake.cleanup();
+  }
+});
+
+test('an unknown provenance is reported, never pinned and never released', async () => {
+  const { fake, operations } = await setup();
+  try {
+    const workspace = await fake.workspace.add(join(fake.workspace.root, 'one'), 'one');
+    const packageDir = await notesPackage(fake.workspace.root);
+    const imported = await write(operations, { action: 'import', path: packageDir });
+    await write(operations, {
+      action: 'bind',
+      workspaceId: workspace.workspaceId,
+      packageName: imported.packageName,
+      version: imported.version,
+    });
+    // Someone enables it, and the record carries no provenance - the shape an
+    // upgrade from a build without this field leaves behind.
+    fake.bundles.get('dsh-scaffold-notes').enabled = true;
+    await operations.store.mutate(
+      { action: 'reconcile', operationId: newId(), expectedRevision: operations.store.revision },
+      (draft) => {
+        draft.packages['dsh-scaffold-notes@0.1.0'].lastAppliedEnabled = null;
+        return {};
+      },
+    );
+
+    const reconciled = await operations.reconcileFromEvent();
+    const entry = reconciled.drift.find((row) => row.key === 'dsh-scaffold-notes@0.1.0');
+    assert.equal(entry?.change, 'provenance-unknown');
+    assert.equal(entry?.action, undefined, 'an unknown must not be turned into a pin');
+
+    const snapshot = await operations.execute({ action: 'list' });
+    assert.equal(snapshot.packages.find((row) => row.key === 'dsh-scaffold-notes@0.1.0').pinned, false);
+    assert.equal(fake.bundles.get('dsh-scaffold-notes').enabled, true, 'and must not be released either');
+  } finally {
+    await fake.cleanup();
+  }
+});
+
 test('a stale revision is refused even when the action would have been a no-op', async () => {
   const { fake, operations } = await setup();
   try {

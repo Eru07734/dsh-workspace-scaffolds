@@ -138,7 +138,7 @@ export class Operations {
 
   /**
    * Run a native enable/disable/install while this plugin's own change events
-   * are held back.
+   * are held back, and record the enablement this plugin just applied.
    *
    * The plugin manager emits `plugin-manager/changed` for every write,
    * including ours. Without this guard the reconciliation triggered by our own
@@ -146,14 +146,21 @@ export class Operations {
    * is committed afterwards) and conclude it was enabled externally, pinning
    * it - which permanently defeats shelving for exactly the bundles this plugin
    * turned on.
+   *
+   * The recorded flag is what lets a *later* reconciliation - including one
+   * after a restart, where no in-memory state survives - still tell this
+   * plugin's own unreleased leftover from intent that came from outside.
    * @template T
+   * @param {{key: string, enabled: boolean}|null} applied What this write sets, or null when it sets nothing.
    * @param {() => Promise<T>} operation
    * @returns {Promise<T>}
    */
-  async #nativeWrite(operation) {
+  async #nativeWrite(applied, operation) {
     this.#nativeDepth += 1;
     try {
-      return await operation();
+      const result = await operation();
+      if (applied !== null) await this.store.recordApplied(applied.key, applied.enabled);
+      return result;
     } finally {
       this.#nativeDepth -= 1;
     }
@@ -512,7 +519,7 @@ export class Operations {
     const before = evaluatePackage(bundles, imported.name, imported.version);
     let installOutcome = 'skipped';
     if (args.install !== false && before.status === 'absent') {
-      const result = await this.#nativeWrite(() =>
+      const result = await this.#nativeWrite(null, () =>
         this.host.installBundle(archivePath(this.store, imported.archiveSha256), {
           requestId: request.operationId,
         }),
@@ -539,6 +546,7 @@ export class Operations {
           initiallyEnabled: after.enabled,
           ownership: after.enabled ? 'external' : 'managed',
           pinned: after.enabled,
+          lastAppliedEnabled: after.enabled,
           title: imported.title,
           importedAt: nowIso(),
           archiveEntryCount: imported.entryCount,
@@ -663,6 +671,7 @@ export class Operations {
             initiallyEnabled: evaluated.enabled,
             ownership: evaluated.enabled ? 'external' : 'managed',
             pinned: evaluated.enabled,
+            lastAppliedEnabled: evaluated.enabled,
             title: null,
             importedAt: nowIso(),
             archiveEntryCount: null,
@@ -861,7 +870,7 @@ export class Operations {
             failures.push({ key: step.key, code: fault.code, details: fault.details });
             continue;
           }
-          await this.#nativeWrite(() => this.host.installBundle(archivePath(this.store, sha), {}));
+          await this.#nativeWrite(null, () => this.host.installBundle(archivePath(this.store, sha), {}));
           bundles = await readBundles(this.host);
           evaluated = evaluatePackage(bundles, step.packageName, step.version);
           if (evaluated.status !== 'match') {
@@ -880,7 +889,7 @@ export class Operations {
           applied.push({ key: step.key, application: 'already-enabled' });
           continue;
         }
-        const result = await this.#nativeWrite(() => this.host.setBundleEnabled(step.packageName, true));
+        const result = await this.#nativeWrite({ key: step.key, enabled: true }, () => this.host.setBundleEnabled(step.packageName, true));
         const application = typeof result?.application === 'string' ? result.application : 'applied';
         newlyEnabled.push(step.packageName);
         applied.push({ key: step.key, application, warnings: jsonSafe(result?.warnings ?? null) });
@@ -936,7 +945,7 @@ export class Operations {
         continue;
       }
       try {
-        await this.#nativeWrite(() => this.host.setBundleEnabled(name, false));
+        await this.#nativeWrite({ key, enabled: false }, () => this.host.setBundleEnabled(name, false));
         disabled.push(name);
       } catch (error) {
         kept.push({ name, reason: 'compensation-failed', detail: error instanceof Error ? error.message : String(error) });
@@ -1040,7 +1049,7 @@ export class Operations {
         continue;
       }
       try {
-        const result = await this.#nativeWrite(() => this.host.setBundleEnabled(name, false));
+        const result = await this.#nativeWrite({ key, enabled: false }, () => this.host.setBundleEnabled(name, false));
         const application = typeof result?.application === 'string' ? result.application : 'applied';
         released.push({ key, outcome: application });
         if (application === 'failed' || application === 'cancelled') {
@@ -1180,6 +1189,18 @@ export class Operations {
 
   /**
    * Re-read native state after a restart or an out-of-band change.
+   *
+   * The question this answers is whether an enabled bundle should survive the
+   * next shelf. Three answers, because there are three situations:
+   *
+   * - a lease explains it (an awake workspace asked for it) - nothing to report;
+   * - this plugin applied the current state and has not released it - its own
+   *   leftover, safe to release later, so it is *not* pinned;
+   * - this plugin knows it last left the bundle off, or the provenance is
+   *   unknown - somebody else may want it, so it is left alone and reported.
+   *   Only the definite "we left it off" case pins, because pinning is what
+   *   protects outside intent, and it must never be applied on a guess: a wrong
+   *   pin silently welds the bundle on and stops shelving from ever working.
    * @returns {Promise<object>}
    */
   async #reconcile() {
@@ -1190,15 +1211,25 @@ export class Operations {
     for (const [key, record] of Object.entries(state.packages)) {
       const { name, version } = parsePackageKey(key);
       const evaluated = evaluatePackage(bundles, name, version);
-      const holders = leases.get(key) ?? [];
-      // A lease is the explanation for an enabled bundle: an awake workspace
-      // asked for it. Only an enabled bundle that *nothing* claims is evidence
-      // of intent from outside this plugin. Without this check, a bundle this
-      // plugin just enabled would be judged external and pinned, which would
-      // permanently stop shelving it.
-      const unclaimed = holders.length === 0;
-      if (evaluated.enabled && record.ownership === 'managed' && !record.pinned && unclaimed) {
-        drift.push({ key, change: 'enabled-outside-management', action: 'pinned' });
+      const leased = (leases.get(key) ?? []).length > 0;
+      const managed = record.ownership === 'managed' && !record.pinned;
+
+      if (managed && evaluated.enabled && !leased) {
+        if (record.lastAppliedEnabled === true) {
+          // Ours, and no workspace is holding it: a shelf that did not finish, or
+          // a restart that dropped the queued one. Releasable, never pinned.
+          drift.push({ key, change: 'enabled-by-us-unreleased' });
+        } else if (record.lastAppliedEnabled === false) {
+          drift.push({ key, change: 'enabled-outside-management', action: 'pinned' });
+        } else {
+          // Written before provenance was recorded. Report rather than guess:
+          // pinning on an unknown would wedge the bundle, and releasing on an
+          // unknown would disable something this plugin never enabled.
+          drift.push({ key, change: 'provenance-unknown' });
+        }
+      }
+      if (managed && !evaluated.enabled && record.lastAppliedEnabled === true) {
+        drift.push({ key, change: 'disabled-outside-management' });
       }
       if (evaluated.status === 'absent' && record.restoreCapability === 'archived') {
         drift.push({ key, change: 'uninstalled-but-archived' });

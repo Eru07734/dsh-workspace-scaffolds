@@ -1,6 +1,6 @@
 {
   "name": "dsh-workspace-scaffolds",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "把 DSH 工程与工程使用的脚手架插件关联起来：开工前准备、工作中追加、不用时休眠保留到磁盘、再次使用时随工程恢复。⚠️ 仅部分验证，实验性代码。",
   "type": "module",
   "license": "MIT",
